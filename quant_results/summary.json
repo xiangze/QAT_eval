@@ -1,0 +1,50 @@
+{
+  "fp32": {
+    "acc": 5.45,
+    "size_MB": 44.726568
+  },
+  "bits": [
+    2,
+    4,
+    6,
+    8
+  ],
+  "avg_bits": 6.0,
+  "results": [
+    {
+      "method": "HAWQ2_fisher",
+      "acc": 10.09,
+      "size_MB": 8.410344,
+      "mean_bits": 6.022398790121618,
+      "assignment_csv": "./quant_results/HAWQ2_fisher_assignment.csv"
+    },
+    {
+      "method": "OT_HAWQ_like",
+      "acc": 10.04,
+      "size_MB": 8.816872,
+      "mean_bits": 6.313502861431116,
+      "assignment_csv": "./quant_results/OT_HAWQ_like_assignment.csv"
+    },
+    {
+      "method": "OT_Fisher_Critical",
+      "acc": 11.09,
+      "size_MB": 8.816872,
+      "mean_bits": 6.313502861431116,
+      "assignment_csv": "./quant_results/OT_Fisher_Critical_assignment.csv"
+    },
+    {
+      "method": "DiffSinkhornDynamic",
+      "acc": 12.02,
+      "size_MB": 8.149224,
+      "mean_bits": 5.835417585628111,
+      "assignment_csv": "./quant_results/DiffSinkhornDynamic_assignment.csv"
+    },
+    {
+      "method": "SinkhornMCKPDynamic",
+      "acc": 10.0,
+      "size_MB": 7.691448,
+      "mean_bits": 5.507616161500432,
+      "assignment_csv": "./quant_results/SinkhornMCKPDynamic_assignment.csv"
+    }
+  ]
+}
