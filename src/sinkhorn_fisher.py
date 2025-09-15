@@ -11,6 +11,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import util
 
 # -------------------------------
 # Utilities: collect target layers
@@ -358,6 +359,83 @@ def ot_allocate_bits_for_model(
         target_counts=counts,
         cost_matrix=C.detach().cpu()
     )
+
+def sinkhorn_log(cost: torch.Tensor, a: torch.Tensor, b: torch.Tensor, eps=0.02, iters=400):
+    K = -cost/eps
+    f = torch.zeros(cost.size(0), device=cost.device)
+    g = torch.zeros(cost.size(1), device=cost.device)
+    def lse(x, dim=-1):
+        m,_ = torch.max(x, dim=dim, keepdim=True)
+        return (m + torch.log(torch.sum(torch.exp(x-m), dim=dim, keepdim=True))).squeeze(dim)
+    log_a = torch.log(a+1e-40); log_b = torch.log(b+1e-40)
+    for _ in range(iters):
+        f = log_a - lse(K + g.unsqueeze(0), dim=1)
+        g = log_b - lse((K + f.unsqueeze(1)).transpose(0,1), dim=1)
+    P = torch.exp(K + f.unsqueeze(1) + g.unsqueeze(0))
+    return P / (P.sum() + 1e-40)
+
+def build_cost_sens_size_pow2(model: nn.Module, sens: Dict[str,float], bits: List[int], device) -> Tuple[torch.Tensor,List[str],List[int]]:
+    names, sizes = [], []
+    for name, m in iter_quant_layers(model):
+        names.append(name)
+        sizes.append(m.weight.numel())
+    s = torch.tensor([sens[nm] for nm in names], dtype=torch.float64, device=device)
+    n = torch.tensor(sizes, dtype=torch.float64, device=device)
+    err = torch.tensor([2.0**(-2*b) for b in bits], dtype=torch.float64, device=device)
+    C = (s.unsqueeze(1)*n.unsqueeze(1))*err.unsqueeze(0)
+    return C.to(torch.float32), names, sizes
+
+def maxent_b_dist(bits: List[int], target_avg: float) -> List[float]:
+    b = torch.tensor(bits, dtype=torch.float64)
+    lo,hi = -50.0,50.0
+    for _ in range(80):
+        mid = 0.5*(lo+hi)
+        w = torch.exp(mid*b); q=w/w.sum(); m=float((q*b).sum())
+        if m < target_avg: lo=mid
+        else: hi=mid
+    lam = 0.5*(lo+hi); w=torch.exp(lam*b); q=(w/w.sum()).tolist()
+    return q
+
+def size_aware_rounding(P: torch.Tensor, sizes: List[int], bits: List[int], col_fracs: List[float]) -> Dict[str,int]:
+    L,B = P.shape
+    total = sum(sizes)
+    capacities = [int(round(total*f)) for f in col_fracs]
+    items = []
+    for i in range(L):
+        for j in range(B):
+            items.append((float(P[i,j].item()), i, j))
+    items.sort(reverse=True, key=lambda x:x[0])
+    assigned = [-1]*L
+    used = [0]*B
+    for score,i,j in items:
+        if assigned[i]!=-1: continue
+        if used[j] + sizes[i] <= capacities[j]:
+            assigned[i]=j; used[j]+=sizes[i]
+        if all(x!=-1 for x in assigned): break
+    # fallback
+    for i in range(L):
+        if assigned[i]==-1:
+            j = max(range(B), key=lambda jb: P[i,jb].item())
+            assigned[i]=j
+    return assigned
+
+def ot_hawq_like_allocate(model: nn.Module, loader: DataLoader, device, bits: List[int],
+                          avg_bits: float, sens_batches=1, eps=0.02, iters=400) -> Dict[str,int]:
+    sens = util.empirical_fisher_sensitivity(model, loader, device, batches=sens_batches)
+    C, names, sizes = build_cost_sens_size_pow2(model, sens, bits, device)
+    n = torch.tensor(sizes, dtype=torch.float32, device=device); a = n/n.sum()
+    col_fracs = maxent_b_dist(bits, avg_bits)
+    b = torch.tensor(col_fracs, dtype=torch.float32, device=device)
+    P = sinkhorn_log(C, a, b, eps, iters)  # [L,B]
+    idxs = size_aware_rounding(P, sizes, bits, col_fracs)
+    return {nm: bits[idxs[i]] for i,nm in enumerate(names)}
+
+def ot_fisher_critical_allocate(model: nn.Module, loader: DataLoader, device, bits: List[int],
+                                avg_bits: float, sens_batches=1,
+                                critical_ids: Optional[List[int]] = None) -> Dict[str,int]:
+    # For simplicity: if no critical_ids given -> same as OT_HAWQ_like
+    return ot_hawq_like_allocate(model, loader, device, bits, avg_bits, sens_batches=sens_batches)
+
 
 # ----------------------------------------
 # Example usage (skeleton)

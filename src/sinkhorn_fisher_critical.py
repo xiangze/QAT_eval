@@ -13,7 +13,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import util
 # -------------------------------
 # Critical-category logit/label transform (classification-friendly)
 #   For detection/DETR, supply your own loss callback using same idea.
@@ -357,9 +357,9 @@ def allocate_bits_sinkhorn_fisher(
 
     # 2) layer meta
     layer_names, layer_sizes = [], []
-    for name, m in iter_quant_layers(model):
+    for name, m in util.iter_quant_layers(model):
         layer_names.append(name)
-        layer_sizes.append(param_count(m))
+        layer_sizes.append(util.param_count(m))
 
     # 3) cost and marginals
     C, a, nvec, total_params = build_cost_and_marginals(

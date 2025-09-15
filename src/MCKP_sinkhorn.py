@@ -14,6 +14,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import util
+from totch import DataLoader
+import diff_sinkhorn as dOT
+import HAWQ2_fisher as h2
 
 # ---------------------------
 # STE quantization
@@ -253,7 +256,7 @@ def estimate_trH_empirical_fisher(model: nn.Module,
     Approximate tr(H_i) with sum of grad^2 (empirical Fisher diag sum) per layer.
     """
     model.train()
-    sens = {name: 0.0 for name, _ in iter_quant_layers(model)}
+    sens = {name: 0.0 for name, _ in util.iter_quant_layers(model)}
     counts = {k: 0 for k in sens.keys()}
 
     it = iter(dataloader)
@@ -268,7 +271,7 @@ def estimate_trH_empirical_fisher(model: nn.Module,
             if p.grad is not None: p.grad.zero_()
         loss = loss_callback(model, args, kwargs)  # returns scalar loss
         loss.backward()
-        for name, m in iter_quant_layers(model):
+        for name, m in util.iter_quant_layers(model):
             g2, n = 0.0, 0
             for p in m.parameters():
                 if p.grad is None: continue
@@ -306,7 +309,7 @@ def hutchinson_trH_step(model: nn.Module,
     # accumulate per layer: sum(H_ii) ≈ v ⊙ (Hv) summed over params
     traces = {}
     idx = 0
-    for name, m in iter_quant_layers(model):
+    for name, m in util.iter_quant_layers(model):
         layer_params = [p for p in m.parameters() if p.requires_grad]
         n_elems = sum(p.numel() for p in layer_params)
         # map hvp/grads slices accordingly
@@ -343,6 +346,67 @@ def forward_with_dynamic_bits(model: nn.Module,
     total = task_loss + budget_reg
     return total, {"task_loss": task_loss, "budget_reg": budget_reg, "P": P.detach().cpu()}
 
+def  sinkhorn_MCKP_allocate(model_ctor: Callable[[], nn.Module],
+                              train_loader: DataLoader, val_loader: DataLoader,device, 
+                              bits: List[int], avg_bits: float,
+                              steps: int = 50, lr: float = 1e-4,
+                              chen: bool = False) -> Dict[str,int]:
+    base = model_ctor().to(device)
+    # meta
+    names, sizes = [], []
+    for name, m in util.iter_quant_layers(base):
+        names.append(name); sizes.append(m.weight.numel())
+    # allocator
+    if chen:
+        alloc = ChenDifferentiableAllocator(names, sizes, bits, device).to(device)
+        # initial trH
+        tr_map = estimate_trH_empirical_fisher(base, train_loader, device, batches=2)
+        alloc.update_trH(tr_map)
+    else:
+        alloc = dOT.DifferentiableAllocator(names, sizes, bits, device).to(device)
+        s_map = h2.empirical_fisher_sensitivity(base, train_loader, device, batches=2)
+        alloc.update_sensitivity(s_map)
+    # wrap model with mixture modules
+    model = model_ctor().to(device)
+    if chen:
+        # just reuse mixture layers using diff allocator for STE forward;
+        # we can still read P from Chen allocator by injecting alloc._P before forward
+        pass
+    model = wrap_model_with_ot_quant(model,alloc,bits).to(device)
+    
+    ce = nn.CrossEntropyLoss()
+    opt = torch.optim.Adam(list(model.parameters()) + list(alloc.parameters()), lr=lr)
+    it = iter(train_loader)
+    for step in range(steps):
+        try: x,y = next(it)
+        except StopIteration:
+            it = iter(train_loader); x,y = next(it)
+        x,y = x.to(device), y.to(device)
+        opt.zero_grad()
+        # refresh stats
+        if chen: alloc.update_wmax_from_model(model)
+        # compute P
+        P = alloc.compute_P(eps=0.02, iters=150)
+        alloc._P = P  # inject
+        logits = model(x)
+        loss = ce(logits, y)
+        loss = loss + (alloc.budget_reg(P, avg_bits, weight=1e-3))
+        loss.backward()
+        opt.step()
+        if step % 20 == 0:
+            with torch.no_grad():
+                bits_t = torch.tensor(bits, device=device, dtype=P.dtype)
+                Eb = (alloc.a.unsqueeze(1)*P*bits_t.unsqueeze(0)).sum().item()
+            print(f"[dynamic {'Chen' if chen else 'Diff'}] step {step} Eb≈{Eb:.3f}")
+
+    # Harden: take argmax per row
+    with torch.no_grad():
+        P = alloc.compute_P(eps=0.02, iters=200)
+        idxs = P.argmax(dim=1).tolist()
+    assignment = {names[i]: bits[idxs[i]] for i in range(len(names))}
+    return assignment
+
+
 # ---------------------------
 # Minimal example (classification + FakeData)
 # ---------------------------
@@ -370,9 +434,9 @@ if __name__ == "__main__":
 
         # Layer meta
         layer_names, layer_sizes = [], []
-        for name, mod in iter_quant_layers(model):
+        for name, mod in util.iter_quant_layers(model):
             layer_names.append(name)
-            layer_sizes.append(param_count(mod))
+            layer_sizes.append(util.param_count(mod))
 
         bits = [2,4,6,8]
         alloc = ChenDifferentiableAllocator(layer_names, layer_sizes, bits, device).to(device)
