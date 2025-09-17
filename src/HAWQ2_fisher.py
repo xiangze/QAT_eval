@@ -38,29 +38,24 @@ def empirical_fisher_sensitivity(model: nn.Module, loader: DataLoader, device, b
     for k in sens.keys(): sens[k] /= ssum
     return sens  # sum=1
 
-def hawq2_fisher_allocate(model: nn.Module, loader: DataLoader, device,
-                          bits: List[int], avg_bits: float, batches=1) -> Dict[str,int]:
-    sens = empirical_fisher_sensitivity(model, loader, device, batches=batches)
-    items = []
-    for name, m in util.iter_quant_layers(model):
-        n = m.weight.numel() if hasattr(m,"weight") and m.weight is not None else 0
-        items.append((name, sens[name], n))
-    # importance score: s_i * n_i
-    items.sort(key=lambda x: x[1]*x[2], reverse=True)
-    # target param-mass per bit
-    total = sum(n for _,_,n in items)
-    # derive column fractions via max-entropy under E[b]=avg_bits
+
+"""
+平均ビット制約 E[b]=target_avg の下で最大エントロピー分布 q(b)∝exp(λ b) を二分探索で解く。
+"""
+def maxent_bit_distribution(bits: List[int], avg_bits: float,lo=-50,hi=50.) -> List[float]:
     b = torch.tensor(bits, dtype=torch.float64)
-    lo, hi = -50.0, 50.0
     def mean_bits(lmb):
         w = torch.exp(lmb*b); q = w/w.sum(); return float((q*b).sum())
     for _ in range(80):
         mid = 0.5*(lo+hi); m = mean_bits(mid)
         if m < avg_bits: lo = mid
         else: hi = mid
-    lam = 0.5*(lo+hi); w = torch.exp(lam*b); q = (w/w.sum()).tolist()
-    capacities = [int(round(total * qi)) for qi in q]  # in params
-    # greedy fill: assign larger bits to more important layers until capacity
+    lam = 0.5*(lo+hi); 
+    w = torch.exp(lam*b); 
+    return  (w/w.sum()).tolist()
+
+# greedy fill: assign larger bits to more important layers until capacity
+def greedy_rounding_assignment(capacities,bits,items):
     assignment = {}
     used = [0]*len(bits)
     for name, s, n in items:
@@ -73,3 +68,15 @@ def hawq2_fisher_allocate(model: nn.Module, loader: DataLoader, device,
         assignment[name] = bits[best_j]
         used[best_j] += n
     return assignment
+
+def hawq2_fisher_allocate(model: nn.Module, loader: DataLoader, device,
+                          bits: List[int], avg_bits: float, batches=1) -> Dict[str,int]:
+    sens = empirical_fisher_sensitivity(model, loader, device, batches=batches)
+    items =[(name, sens[name], m.weight.numel()) if (hasattr(m,"weight") and m.weight is not None) else (name, sens[name], 0) for name, m in util.iter_quant_layers(model) ]
+    # importance score: s_i * n_i
+    items.sort(key=lambda x: x[1]*x[2], reverse=True)
+    # target param-mass per bit
+    total = sum(n for _,_,n in items)
+    q=maxent_bit_distribution(bits,avg_bits)
+    capacities = [int(round(total*qi)) for qi in q]  # in params
+    return greedy_rounding_assignment(capacities,bits,items)

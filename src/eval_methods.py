@@ -183,26 +183,15 @@ def evaluate_top1(model: nn.Module, loader: DataLoader, device) -> float:
         total += y.numel()
     return 100.0 * corr / max(1,total)
 
-# =========================
-# Method A: HAWQ2_fisher (greedy)
-# =========================
-# =========================
-# Method B: OT_HAWQ_like
-# =========================
 
-# =========================
-# Method C: OT_Fisher_Critical (同 API)
-#   クリティカル変換省略時はOT_HAWQ_likeと同じ
-# =========================
+"""
+Experiment runner
 
-# =========================
-# Method D/E: Differentiable Sinkhorn (dynamic)
-#   - Minimal inlined versions from previous prototypes
-# =========================
-
-# =========================
-# Experiment runner
-# =========================
+Method A: HAWQ2_fisher (greedy)
+Method B: OT_HAWQ_like
+Method C: OT_Fisher_Critical (同 API)  クリティカル変換省略時はOT_HAWQ_likeと同じ
+Method D/E: Differentiable Sinkhorn (dynamic) - Minimal inlined versions from previous prototypes
+"""
 def run(args):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     os.makedirs(args.out_dir, exist_ok=True)

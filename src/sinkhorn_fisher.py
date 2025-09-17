@@ -11,6 +11,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader
 import util
 import libquantum as q
 import HAWQ2_fisher as h2
@@ -333,9 +335,6 @@ def ot_fisher_critical_allocate(model: nn.Module, loader: DataLoader, device,
 # ----------------------------------------
 if __name__ == "__main__":
     # 例: CIFAR-10 + ResNet18 での使用（ダミー最小例）
-    # 実際には DataLoader/モデル定義をあなたの環境に合わせて差し替えてください。
-    from torchvision import datasets, transforms, models
-    from torch.utils.data import DataLoader
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # データ（1バッチだけ使う簡易校正）
@@ -360,7 +359,7 @@ if __name__ == "__main__":
 
     #critical ?
     result = ot_fisher_critical_allocate(model,dl,device,cfg)
-    backup = q.apply_weight_quantization_inplace(model, result.assignment, cfg.bits, keep_original=True )
+    backup = q.apply_weight_quantization_inplace(model, result, cfg.bits, keep_original=True )
     # …ここで評価/微調整など…
     # 復元する場合:
     # restore_weights_from_backup(model, backup)
