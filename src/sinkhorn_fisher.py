@@ -12,20 +12,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import util
-
-# -------------------------------
-# Utilities: collect target layers
-# -------------------------------
-
-def iter_quant_layers(model: nn.Module) -> Iterable[Tuple[str, nn.Module]]:
-    """Conv2d / Linear を量子化対象として列挙（必要に応じて拡張）"""
-    for name, m in model.named_modules():
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            yield name, m
-
-def param_count(m: nn.Module) -> int:
-    return sum(p.numel() for p in m.parameters() if p.requires_grad)
-
+import libquantum as q
+import HAWQ2_fisher as h2
 # ----------------------------------------
 # Sensitivity: empirical Fisher (grad^2)
 # ----------------------------------------
@@ -48,7 +36,7 @@ def layer_sensitivity_empirical_fisher(
     1〜数バッチで十分な相対比較になることが多い。
     """
     model.train()
-    sens = {name: 0.0 for name, _ in iter_quant_layers(model)}
+    sens = {name: 0.0 for name, _ in util.iter_quant_layers(model)}
     counts = {name: 0 for name in sens.keys()}
 
     n_used = 0
@@ -64,13 +52,13 @@ def layer_sensitivity_empirical_fisher(
         loss.backward()
 
         # accumulate grad^2 per layer (weights only)
-        for name, m in iter_quant_layers(model):
+        for name, m in util.iter_quant_layers(model):
             g2_sum = 0.0
             n = 0
             for p in m.parameters():
                 if p.grad is None: 
                     continue
-                g2_sum += torch.sum(p.grad.detach() ** 2).item()
+                g2_sum += torch.sum(p.grad.detach()**2).item()
                 n += p.numel()
             if n > 0:
                 sens[name] += g2_sum / n  # 平均 grad^2
@@ -215,87 +203,8 @@ def greedy_rounding(P: torch.Tensor, target_counts: List[int]) -> List[int]:
     return assigned  # len=L, 値は bit-index
 
 # ----------------------------------------
-# Quantization (weights per-tensor symmetric uniform)
+# 本体
 # ----------------------------------------
-
-def quantize_weight_per_tensor_symmetric(w: torch.Tensor, bits: int) -> torch.Tensor:
-    if bits >= 32:
-        return w.clone()
-    qmax = (1 << (bits - 1)) - 1
-    scale = w.detach().abs().max() / (qmax + 1e-12)
-    scale = max(scale.item(), 1e-12)
-    q = torch.clamp(torch.round(w / scale), min=-qmax-1, max=qmax)
-    return q * scale
-
-@dataclass
-class QuantAssignment:
-    layer_names: List[str]
-    bit_indices: List[int]   # 同じ順序で bits[bit_indices[i]] が割当ビット
-
-def apply_weight_quantization_inplace(
-    model: nn.Module,
-    assignment: QuantAssignment,
-    bits: List[int],
-    keep_original: bool = True,
-) -> Dict[str, torch.Tensor]:
-    """
-    割当にもとづき Conv/Linear の weight を in-place 量子化。
-    keep_original=True のときは元の重みを返す（復元用）。
-    """
-    backup = {}
-    name2bit = {name: bits[idx] for name, idx in zip(assignment.layer_names, assignment.bit_indices)}
-
-    for name, m in iter_quant_layers(model):
-        b = name2bit.get(name, None)
-        if b is None:
-            continue
-        # 対象: weight のみ（bias は非量子化）
-        if hasattr(m, 'weight') and m.weight is not None:
-            if keep_original:
-                backup[f"{name}.weight"] = m.weight.detach().clone()
-            with torch.no_grad():
-                q = quantize_weight_per_tensor_symmetric(m.weight.data, b)
-                m.weight.data.copy_(q)
-
-    return backup  # 復元時に用いる
-
-def restore_weights_from_backup(model: nn.Module, backup: Dict[str, torch.Tensor]):
-    with torch.no_grad():
-        for key, tensor in backup.items():
-            # key 例: "layer3.0.conv1.weight"
-            # state_dict() と同じキー体系でアクセス
-            module_key, param_name = key.rsplit(".", 1)
-            # 直接 Module をたどる
-            mod = model
-            for attr in module_key.split("."):
-                if attr.isdigit():
-                    mod = mod[int(attr)]  # Sequential 等
-                else:
-                    mod = getattr(mod, attr)
-            getattr(mod, param_name).data.copy_(tensor)
-
-# ----------------------------------------
-# End-to-end pipeline
-# ----------------------------------------
-
-@dataclass
-class OTQuantConfig:
-    bits: List[int] = None                  # 例: [2,4,6,8]
-    avg_bits: float = 6.0                   # 目標平均
-    epsilon: float = 0.01                   # Sinkhorn 温度
-    sinkhorn_iters: int = 500
-    sens_batches: int = 1                   # 感度推定に使うバッチ数
-
-    def __post_init__(self):
-        if self.bits is None:
-            self.bits = [2,4,6,8]
-
-@dataclass
-class OTQuantResult:
-    assignment: QuantAssignment
-    P: torch.Tensor
-    target_counts: List[int]
-    cost_matrix: torch.Tensor
 
 def build_cost_matrix(
     sens: Dict[str, float],
@@ -321,23 +230,17 @@ def ot_allocate_bits_for_model(
     dataloader,
     loss_fn,
     device: torch.device,
-    config: OTQuantConfig = OTQuantConfig(),
-) -> OTQuantResult:
+    config: q.OTQuantConfig = q.OTQuantConfig(),
+    ) -> q.OTQuantResult:
     # 1) 感度推定
-    sens = layer_sensitivity_empirical_fisher(
-        model, dataloader, loss_fn, device, num_batches=config.sens_batches
-    )
+    sens = layer_sensitivity_empirical_fisher(model, dataloader, loss_fn, device, num_batches=config.sens_batches)
 
     # 2) レイヤ情報
-    layer_names: List[str] = []
-    layer_sizes: List[int] = []
-    for name, m in iter_quant_layers(model):
-        layer_names.append(name)
-        layer_sizes.append(param_count(m))
+    pairs = [(name, util.param_count(m)) for name, m in util.iter_quant_layers(model)]
+    layer_names, layer_sizes = (list(t) for t in zip(*pairs))
 
     L = len(layer_names)
     bits = config.bits[:]
-    B = len(bits)
 
     # 3) コスト行列
     C = build_cost_matrix(sens, layer_names, layer_sizes, bits, device)
@@ -353,30 +256,15 @@ def ot_allocate_bits_for_model(
     # 6) 整数割当
     bit_indices = greedy_rounding(P, counts)  # [L] in [0..B-1]
 
-    return OTQuantResult(
-        assignment=QuantAssignment(layer_names=layer_names, bit_indices=bit_indices),
+    return q.OTQuantResult(
+        assignment=q.QuantAssignment(layer_names=layer_names, bit_indices=bit_indices),
         P=P.detach().cpu(),
-        target_counts=counts,
-        cost_matrix=C.detach().cpu()
-    )
+        target_counts=counts, cost_matrix=C.detach().cpu() )
 
-def sinkhorn_log(cost: torch.Tensor, a: torch.Tensor, b: torch.Tensor, eps=0.02, iters=400):
-    K = -cost/eps
-    f = torch.zeros(cost.size(0), device=cost.device)
-    g = torch.zeros(cost.size(1), device=cost.device)
-    def lse(x, dim=-1):
-        m,_ = torch.max(x, dim=dim, keepdim=True)
-        return (m + torch.log(torch.sum(torch.exp(x-m), dim=dim, keepdim=True))).squeeze(dim)
-    log_a = torch.log(a+1e-40); log_b = torch.log(b+1e-40)
-    for _ in range(iters):
-        f = log_a - lse(K + g.unsqueeze(0), dim=1)
-        g = log_b - lse((K + f.unsqueeze(1)).transpose(0,1), dim=1)
-    P = torch.exp(K + f.unsqueeze(1) + g.unsqueeze(0))
-    return P / (P.sum() + 1e-40)
 
 def build_cost_sens_size_pow2(model: nn.Module, sens: Dict[str,float], bits: List[int], device) -> Tuple[torch.Tensor,List[str],List[int]]:
     names, sizes = [], []
-    for name, m in iter_quant_layers(model):
+    for name, m in util.iter_quant_layers(model):
         names.append(name)
         sizes.append(m.weight.numel())
     s = torch.tensor([sens[nm] for nm in names], dtype=torch.float64, device=device)
@@ -419,62 +307,61 @@ def size_aware_rounding(P: torch.Tensor, sizes: List[int], bits: List[int], col_
             assigned[i]=j
     return assigned
 
+"""
+全層一括
+"""
 def ot_hawq_like_allocate(model: nn.Module, loader: DataLoader, device, bits: List[int],
                           avg_bits: float, sens_batches=1, eps=0.02, iters=400) -> Dict[str,int]:
-    sens = util.empirical_fisher_sensitivity(model, loader, device, batches=sens_batches)
+    sens = h2.empirical_fisher_sensitivity(model, loader, device, batches=sens_batches)
     C, names, sizes = build_cost_sens_size_pow2(model, sens, bits, device)
-    n = torch.tensor(sizes, dtype=torch.float32, device=device); a = n/n.sum()
+    n = torch.tensor(sizes, dtype=torch.float32, device=device)
+    a = n/n.sum()
     col_fracs = maxent_b_dist(bits, avg_bits)
     b = torch.tensor(col_fracs, dtype=torch.float32, device=device)
-    P = sinkhorn_log(C, a, b, eps, iters)  # [L,B]
+    P = sinkhorn_transport(C, a, b, eps, iters)  # [L,B]
     idxs = size_aware_rounding(P, sizes, bits, col_fracs)
     return {nm: bits[idxs[i]] for i,nm in enumerate(names)}
 
-def ot_fisher_critical_allocate(model: nn.Module, loader: DataLoader, device, bits: List[int],
-                                avg_bits: float, sens_batches=1,
-                                critical_ids: Optional[List[int]] = None) -> Dict[str,int]:
+def ot_fisher_critical_allocate(model: nn.Module, loader: DataLoader, device, 
+                                config: q.OTQuantConfig = q.OTQuantConfig(),) -> Dict[str,int]:
     # For simplicity: if no critical_ids given -> same as OT_HAWQ_like
-    return ot_hawq_like_allocate(model, loader, device, bits, avg_bits, sens_batches=sens_batches)
+    return ot_hawq_like_allocate(model, loader, device, config.bits, config.avg_bits, sens_batches=config.sens_batches)
 
 
 # ----------------------------------------
 # Example usage (skeleton)
 # ----------------------------------------
-
 if __name__ == "__main__":
     # 例: CIFAR-10 + ResNet18 での使用（ダミー最小例）
     # 実際には DataLoader/モデル定義をあなたの環境に合わせて差し替えてください。
-    try:
-        from torchvision import datasets, transforms, models
-        from torch.utils.data import DataLoader
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from torchvision import datasets, transforms, models
+    from torch.utils.data import DataLoader
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # データ（1バッチだけ使う簡易校正）
-        tfm = transforms.Compose([transforms.Resize(224), transforms.ToTensor()])
-        ds = datasets.FakeData(size=64, image_size=(3,224,224), num_classes=10, transform=tfm)
-        dl = DataLoader(ds, batch_size=16, shuffle=False)
+    # データ（1バッチだけ使う簡易校正）
+    tfm = transforms.Compose([transforms.Resize(224), transforms.ToTensor()])
+    ds = datasets.FakeData(size=64, image_size=(3,224,224), num_classes=10, transform=tfm)
+    dl = DataLoader(ds, batch_size=16, shuffle=False)
 
-        # モデル
-        model = models.resnet18(num_classes=10).to(device)
-        loss_fn = nn.CrossEntropyLoss()
+    # モデル
+    model = models.resnet18(num_classes=10).to(device)
+    loss_fn = nn.CrossEntropyLoss()
 
-        # OT によるビット配分
-        cfg = OTQuantConfig(bits=[2,4,6,8], avg_bits=6.0, epsilon=0.02, sinkhorn_iters=400, sens_batches=1)
-        result = ot_allocate_bits_for_model(model, dl, loss_fn, device, cfg)
+    # OT によるビット配分
+    cfg = q.OTQuantConfig(bits=[2,4,6,8], avg_bits=6.0, epsilon=0.02, sinkhorn_iters=400, sens_batches=1)
+    result = ot_allocate_bits_for_model(model, dl, loss_fn, device, cfg)
+    
+    # 量子化を適用
+    backup = q.apply_weight_quantization_inplace(model, result.assignment, cfg.bits, keep_original=True )
+    print("Assigned counts per bits:", {b: result.target_counts[i] for i, b in enumerate(cfg.bits)})
+    print("First 10 layer -> bit:", [
+        (result.assignment.layer_names[i], cfg.bits[result.assignment.bit_indices[i]])
+        for i in range(min(10, len(result.assignment.layer_names)))    ])
 
-        # 量子化を適用
-        backup = apply_weight_quantization_inplace(
-            model, result.assignment, cfg.bits, keep_original=True
-        )
-        print("Assigned counts per bits:", {b: result.target_counts[i] for i, b in enumerate(cfg.bits)})
-        print("First 10 layer -> bit:", [
-            (result.assignment.layer_names[i], cfg.bits[result.assignment.bit_indices[i]])
-            for i in range(min(10, len(result.assignment.layer_names)))
-        ])
+    #critical ?
+    result = ot_fisher_critical_allocate(model,dl,device,cfg)
+    backup = q.apply_weight_quantization_inplace(model, result.assignment, cfg.bits, keep_original=True )
+    # …ここで評価/微調整など…
+    # 復元する場合:
+    # restore_weights_from_backup(model, backup)
 
-        # …ここで評価/微調整など…
-        # 復元する場合:
-        # restore_weights_from_backup(model, backup)
-
-    except Exception as e:
-        print("Demo failed (install torchvision for the example):", e)

@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import util
+import libquantum as q
 # -------------------------------
 # Critical-category logit/label transform (classification-friendly)
 #   For detection/DETR, supply your own loss callback using same idea.
@@ -94,7 +95,7 @@ def fisher_sensitivity_mixed_objective(
     s_i = E_batch[ mean( grad_i(alpha*LA + LF)^2 ) ] を層毎に推定。
     """
     model.train()
-    sens = {name: 0.0 for name, _ in iter_quant_layers(model)}
+    sens = {name: 0.0 for name, _ in util.iter_quant_layers(model)}
     counts = {name: 0 for name in sens.keys()}
     exclude_layer_name_contains = exclude_layer_name_contains or []
 
@@ -117,7 +118,7 @@ def fisher_sensitivity_mixed_objective(
         mixed = alpha * LA + LF
         mixed.backward()
 
-        for name, m in iter_quant_layers(model):
+        for name, m in util.iter_quant_layers(model):
             if any(kw in name for kw in exclude_layer_name_contains):
                 continue
             g2_sum = 0.0
@@ -270,48 +271,6 @@ def size_aware_rounding(
     return assigned
 
 # -------------------------------
-# Quantization (per-tensor symmetric)
-# -------------------------------
-
-def quantize_weight_per_tensor_symmetric(w: torch.Tensor, bits: int) -> torch.Tensor:
-    if bits >= 32:
-        return w.clone()
-    qmax = (1 << (bits - 1)) - 1
-    scale = w.detach().abs().max() / (qmax + 1e-12)
-    scale = max(scale.item(), 1e-12)
-    q = torch.clamp(torch.round(w / scale), min=-qmax-1, max=qmax)
-    return q * scale
-
-@dataclass
-class QuantAssignment:
-    layer_names: List[str]
-    bit_indices: List[int]   # index into bits
-
-def apply_weight_quantization_inplace(
-    model: nn.Module,
-    assignment: QuantAssignment,
-    bits: List[int],
-    keep_original: bool = True,
-    exclude_layer_name_contains: Optional[List[str]] = None,
-) -> Dict[str, torch.Tensor]:
-    backup = {}
-    exclude = exclude_layer_name_contains or []
-    name2bit = {name: bits[idx] for name, idx in zip(assignment.layer_names, assignment.bit_indices)}
-    for name, m in iter_quant_layers(model):
-        if any(kw in name for kw in exclude):
-            continue
-        b = name2bit.get(name, None)
-        if b is None:
-            continue
-        if hasattr(m, 'weight') and m.weight is not None:
-            if keep_original:
-                backup[f"{name}.weight"] = m.weight.detach().clone()
-            with torch.no_grad():
-                q = quantize_weight_per_tensor_symmetric(m.weight.data, b)
-                m.weight.data.copy_(q)
-    return backup
-
-# -------------------------------
 # End-to-end: allocate with Fisher-aware critical objective
 # -------------------------------
 
@@ -333,7 +292,7 @@ class OTConfig:
 
 @dataclass
 class OTResult:
-    assignment: QuantAssignment
+    assignment: q.QuantAssignment
     P: torch.Tensor
     cost: torch.Tensor
     a: torch.Tensor
@@ -363,8 +322,7 @@ def allocate_bits_sinkhorn_fisher(
 
     # 3) cost and marginals
     C, a, nvec, total_params = build_cost_and_marginals(
-        sens, layer_names, layer_sizes, cfg.bits, device, error_model="pow2"
-    )
+        sens, layer_names, layer_sizes, cfg.bits, device, error_model="pow2" )
 
     # 4) choose column marginal b to satisfy E[bits]=avg_bits
     b_list = maxent_dist_under_avg(cfg.bits, cfg.avg_bits)
@@ -377,10 +335,9 @@ def allocate_bits_sinkhorn_fisher(
     bit_indices = size_aware_rounding(P, layer_sizes, cfg.bits, b_list)
 
     return OTResult(
-        assignment=QuantAssignment(layer_names=layer_names, bit_indices=bit_indices),
+        assignment=q.QuantAssignment(layer_names=layer_names, bit_indices=bit_indices),
         P=P.detach().cpu(), cost=C.detach().cpu(), a=a.detach().cpu(), b=b.detach().cpu(),
-        layer_names=layer_names, layer_sizes=layer_sizes
-    )
+        layer_names=layer_names, layer_sizes=layer_sizes )
 
 # -------------------------------
 # Fisher-trace regularization for QAT (Eq. (12))
@@ -477,7 +434,7 @@ if __name__ == "__main__":
     result = allocate_bits_sinkhorn_fisher(model, dl, device, loss_cb, cfg)
 
     # 割当を適用（必要に応じて除外パターン指定）
-    backup = apply_weight_quantization_inplace(
+    backup = q.apply_weight_quantization_inplace(
         model,  result.assignment, cfg.bits,
         keep_original=True,
         exclude_layer_name_contains=cfg.exclude_layer_name_contains )
