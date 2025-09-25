@@ -41,10 +41,9 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
-# ここはあなたの量子化ライブラリ名に合わせて変更してください
-# 例: `import quant as q` 等
-import q  # type: ignore
-
+import libquantum as q
+import HAWQ2_fisher as h2
+import sinkhorn_fisher as ot
 
 # -----------------------------
 # 合成 DETR 校正データセット
@@ -225,6 +224,13 @@ class CocoAsDetr(Dataset):
 def loss_fn(loss_scalar: torch.Tensor, _dummy_target: Any) -> torch.Tensor:
     return loss_scalar
 
+def report(result,cfg):
+    print("Assigned counts per bits:", {b: result.target_counts[i] for i, b in enumerate(cfg.bits)})
+    show_n = min(20, len(result.assignment.layer_names))
+    pairs = [ (result.assignment.layer_names[i], cfg.bits[result.assignment.bit_indices[i]])  for i in range(show_n)   ]
+    print(f"First {show_n} layer -> bit:")
+    for name, bit in pairs:
+        print(f"  {name:60s} -> {bit}bit")
 # -----------------------------
 # メイン: 量子化割当て → 重み量子化
 # -----------------------------
@@ -276,18 +282,13 @@ def main():
         # exclude_names=[".*pos_embed.*", ".*query_embed.*"],
     )
 
-    result = ot_allocate_bits_for_model(model, dl, loss_fn, device, cfg)  # type: ignore[name-defined]
+    result = ot.ot_allocate_bits_for_model(model, dl, loss_fn, device, cfg)  # type: ignore[name-defined]
 
     # ラッパー (model) に対して量子化適用（base を直接渡すと名前がずれる場合があるため注意）
     backup = q.apply_weight_quantization_inplace(model, result.assignment, cfg.bits, keep_original=True)
 
     # レポート
-    print("Assigned counts per bits:", {b: result.target_counts[i] for i, b in enumerate(cfg.bits)})
-    show_n = min(20, len(result.assignment.layer_names))
-    pairs = [ (result.assignment.layer_names[i], cfg.bits[result.assignment.bit_indices[i]])  for i in range(show_n)   ]
-    print(f"First {show_n} layer -> bit:")
-    for name, bit in pairs:
-        print(f"  {name:60s} -> {bit}bit")
+    report(result,cfg)
 
     # 参考: 推論時は model.base をそのまま使用（weights は量子化後のものに置換済み）
     # model.base.eval(); predictions = model.base([image_tensor])
