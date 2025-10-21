@@ -130,14 +130,13 @@ class DifferentiableAllocator(nn.Module):
 
     def column_marginal(self) -> torch.Tensor:
         return F.softmax(self.phi, dim=0)  # [B]
-
-    def compute_P(self, cfg: DynOTCfg) -> Tuple[torch.Tensor, torch.Tensor]:
+    
+    def compute_P(self, eps=0.02, iters=200):
         C = self.build_cost()  # [L,B], no params
         b = self.column_marginal()        # [B], learnable
         # bias theta enters as negative cost (larger theta -> prefer that cell)
         C_eff = C - self.theta            # differentiable wrt theta
-        P = sinkhorn_log_diff(C_eff, self.a, b, epsilon=cfg.epsilon, iters=cfg.iters)  # [L,B]
-        return P, b
+        P = sinkhorn_log_diff(C_eff, self.a, b, epsilon=eps, iters=iters)  # [L,B]
 
     def budget_regularizer(self, P: torch.Tensor, cfg: DynOTCfg) -> torch.Tensor:
         # Expected bits over "param mass" (use a as row weights)

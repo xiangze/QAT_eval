@@ -15,11 +15,10 @@ from torchvision import datasets, transforms
 from torchvision.models import get_model_weights
 import HAWQ2_fisher as h2
 import sinkhorn_fisher as OT
-import MCKP_sinkhorn as MCKPs
 import Dynamic_sinkhorn as Dyns
 import util
 import json
-from eval_methods_basic import apply_assignment_inplace,evaluate_top1,quantized_weight_size_mb,mean_bits,save_assignment_csv,model_fp32_size_mb
+from eval_methods_basic import apply_assignment_inplace,evaluate_top1,quantized_weight_size_mb,mean_bits,save_assignment_csv,model_fp32_size_mb,restore_from_backup
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
@@ -113,14 +112,14 @@ def load_dataset(name: str, root: str, train_tf, eval_tf, val_split: float = 0.1
     # 代表的な分類データセット（自動ダウンロード）
     ds_mod = torchvision.datasets
 
-    if name_lower in ["mnist", "fashionmnist"]:
+    if name_lower in ["fashionmnist"]:
         DS = getattr(ds_mod, name_upper(name_lower))
         train_set = DS(root=root, train=True, download=True, transform=train_tf)
         test_set  = DS(root=root, train=False, download=True, transform=eval_tf)
         # 検証はテストをそのまま
         return train_set, test_set, test_set
 
-    if name_lower in ["cifar10", "cifar100", "stl10", "svhn"]:
+    if name_lower in ["mnist","cifar10", "cifar100", "stl10", "svhn"]:
         if name_lower == "stl10":
             train_set = datasets.STL10(root=root, split="train", download=True, transform=train_tf)
             test_set  = datasets.STL10(root=root, split="test",  download=True, transform=eval_tf)
@@ -128,7 +127,7 @@ def load_dataset(name: str, root: str, train_tf, eval_tf, val_split: float = 0.1
             train_set = datasets.SVHN(root=root, split="train", download=True, transform=train_tf)
             test_set  = datasets.SVHN(root=root, split="test",  download=True, transform=eval_tf)
         else:
-            DS = getattr(ds_mod, name_upper(name_lower))
+            DS = getattr(ds_mod, name_lower.upper())
             train_set = DS(root=root, train=True, download=True, transform=train_tf)
             test_set  = DS(root=root, train=False, download=True, transform=eval_tf)
         return train_set, test_set, test_set
@@ -139,6 +138,7 @@ def load_dataset(name: str, root: str, train_tf, eval_tf, val_split: float = 0.1
 def name_upper(name_lower: str) -> str:
     # 'fashionmnist' -> 'FashionMNIST' 等の簡易変換
     return "".join([w.capitalize() for w in name_lower.split()])
+
 
 def replace_classifier(model: nn.Module, num_classes: int) -> nn.Module:
     # 多くの torchvision 分類モデルに対応
@@ -188,6 +188,7 @@ def accuracy_from_logits(logits: torch.Tensor, targets: torch.Tensor) -> float:
     return correct / max(1, targets.size(0))
 
 def run_epoch(model, loader, criterion, optimizer, device, train: bool) -> Tuple[float, float]:
+    model=model.to(device)
     if train:
         model.train()
     else:
@@ -222,8 +223,12 @@ def run_epoch(model, loader, criterion, optimizer, device, train: bool) -> Tuple
     return avg_loss, err
 
 def main(args):
-
     device = torch.device(args.device)
+    if(args.debug):
+        args.epochs=1
+        args.methods=["DiffSinkhornDynamic","SinkhornMCKPDynamic"]
+        args.dataset="MNIST"
+        args.batch_size=4
 
     # 0) 準備
     methods = []
@@ -251,7 +256,7 @@ def main(args):
     # 3) Dataset & DataLoaders
     train_set, val_set, test_set = load_dataset(args.dataset, args.data_root, train_tf, eval_tf, args.val_split, args.seed)
     num_classes = len(getattr(train_set, "classes", getattr(getattr(train_set, "dataset", None), "classes", [])))
-    if num_classes is None or num_classes == 0:
+    if (num_classes is None or num_classes == 0):
         raise RuntimeError("Could not infer num_classes from dataset. Ensure your dataset exposes `.classes` (ImageFolder etc.).")
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
@@ -301,21 +306,14 @@ def main(args):
         elif meth == "OT_HAWQ_like":
             assignment = OT.ot_hawq_like_allocate(qmodel, val_loader, device, args.bits, args.avg_bits,
                                                sens_batches=args.sens_batches, eps=args.sinkhorn_eps, iters=args.sinkhorn_iters)
-        elif meth == "OT_Fisher_Critical":
-            assignment = OT.ot_fisher_critical_allocate(qmodel, val_loader, device, args.bits, args.avg_bits,
-                                                     sens_batches=args.sens_batches, critical_ids=None)
-        elif meth == "DiffSinkhornDynamic":
-            assignment = Dyns.dynamic_sinkhorn_allocate(model_ctor, val_loader, device, args.bits, args.avg_bits,
-                                                   steps=args.dynamic_steps, lr=args.dynamic_lr, chen=False)
-        elif meth == "SinkhornMCKPDynamic":
-            assignment = MCKPs.sinkhorn_MCKP_allocate(model_ctor, val_loader, device, args.bits, args.avg_bits,
-                                                   steps=args.dynamic_steps, lr=args.dynamic_lr, chen=True)
+        elif "Sinkhorn"in meth :
+            assignment = Dyns.dynamic_sinkhorn_allocate(qmodel, val_loader, device, args.bits, args.avg_bits,
+                                                   steps=args.dynamic_steps, lr=args.dynamic_lr, chen=args.chen,MCKP=("MCKP" in meth))
         else:
             raise ValueError(meth)
 
         # apply quantization in-place
-        backup = apply_assignment_inplace(qmodel, assignment)
-        acc = evaluate_top1(qmodel, eval_loader, device)
+        acc = evaluate_top1(qmodel, val_loader, device)
         qsize = quantized_weight_size_mb(qmodel, assignment, include_bias_fp32=True)
         mbits = mean_bits(assignment, qmodel)
         print(f"[{meth}] acc={acc:.2f}%  size={qsize:.2f} MB  mean_bits≈{mbits:.2f}")
@@ -329,19 +327,16 @@ def main(args):
             "mean_bits": mbits,
             "assignment_csv": csv_path
         })
-        # restore (not needed since we use fresh qmodel each time)
-        # restore_from_backup(qmodel, backup)
+
+        if(args.restore):# restore (not needed since we use fresh qmodel each time)
+            backup = apply_assignment_inplace(qmodel, assignment)
+            restore_from_backup(qmodel, backup)
 
     # dump summary
     with open(os.path.join(args.out_dir, "summary.json"), "w") as f:
-        json.dump({
-            "fp32": {"acc": base_acc, "size_MB": base_size},
-            "bits": args.bits, "avg_bits": args.avg_bits,
-            "results": results
-        }, f, indent=2)
+        json.dump(results, f, indent=2)
     print("\n=== Summary ===")
-    print(json.dumps({"fp32":{"acc":base_acc,"size_MB":base_size},"results":results}, indent=2))
-
+    print(json.dumps(results, indent=2))
 
     # 7) Final Test
     test_loss, test_err = run_epoch(model, test_loader, criterion, optimizer, device, train=False)
@@ -349,33 +344,36 @@ def main(args):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Generic torchvision train/eval script (classification).")
-    p.add_argument("--dataset", type=str, required=True,
+    p.add_argument("--dataset",      type=str, required=True,
                         help="Dataset name: ImageFolder | MNIST | FashionMNIST | CIFAR10 | CIFAR100 | STL10 | SVHN")
-    p.add_argument("--data-root", type=str, required=True, help="Dataset root. For ImageFolder, use root/ or root/train,root/val")
-    p.add_argument("--model", type=str, default="resnet18", help="torchvision.models.* name (e.g., resnet18, efficientnet_b0, mobilenet_v3_small)")
-    p.add_argument("--pretrained", action="store_true", help="Use DEFAULT weights if available (fine-tuning).")
-    p.add_argument("--epochs", type=int, default=5)
-    p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--data-root",    type=str,   default="data/", help="Dataset root. For ImageFolder, use root/ or root/train,root/val")
+    p.add_argument("--model",        type=str,   default="resnet18", help="torchvision.models.* name (e.g., resnet18, efficientnet_b0, mobilenet_v3_small)")
+    p.add_argument("--epochs",       type=int,   default=30)
+    p.add_argument("--batch-size",   type=int,   default=64)
+    p.add_argument("--lr",           type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--val-split", type=float, default=0.1, help="Only for ImageFolder single-dir mode.")
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--num-workers",  type=int,   default=4)
+    p.add_argument("--device",       type=str,   default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--val-split",    type=float, default=0.1, help="Only for ImageFolder single-dir mode.")
+    p.add_argument("--seed",         type=int,   default=0)
+    p.add_argument("--pretrained",   action="store_true", help="Use DEFAULT weights if available (fine-tuning).")
     # methods to run
-    p.add_argument("--methods", type=str, nargs="+",
-                   default=["HAWQ2_fisher","OT_HAWQ_like","OT_Fisher_Critical","DiffSinkhornDynamic","SinkhornMCKPDynamic"])
+    p.add_argument("--methods",      type=str,   nargs="+",
+                   default=["HAWQ2_fisher","OT_HAWQ_like","DiffSinkhornDynamic","SinkhornMCKPDynamic"])
     # quant options
-    p.add_argument("--bits", type=int, nargs="+", default=[2,4,6,8])
-    p.add_argument("--avg_bits", type=float, default=6.0)
-    p.add_argument("--sens_batches", type=int, default=2)
+    p.add_argument("--bits",         type=int,   nargs="+", default=[2,4,6,8])
+    p.add_argument("--avg_bits",     type=float, default=6.0)
+    p.add_argument("--sens_batches", type=int,   default=2)
     # sinkhorn
     p.add_argument("--sinkhorn_eps", type=float, default=0.02)
-    p.add_argument("--sinkhorn_iters", type=int, default=400)
+    p.add_argument("--sinkhorn_iters",type=int,  default=400)
     # dynamic
-    p.add_argument("--dynamic_steps", type=int, default=50)
-    p.add_argument("--dynamic_lr", type=float, default=1e-4)
+    p.add_argument("--dynamic_steps",type=int,   default=50)
+    p.add_argument("--dynamic_lr",   type=float, default=1e-4)
+    p.add_argument("--chen",         action="store_true")
 
-    p.add_argument("--out_dir", type=str, default="./quant_results")
+    p.add_argument("--out_dir",      type=str, default="./quant_results")
+    p.add_argument("--debug",        action="store_true")
+    p.add_argument("--restore",      action="store_true")
     args = p.parse_args()
     main(args)

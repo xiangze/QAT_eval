@@ -14,10 +14,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import util
-from totch import DataLoader
+from torch.utils.data import DataLoader
 import diff_sinkhorn as dOT
 import HAWQ2_fisher as h2
-
+from  Dynamic_sinkhorn import estimate_trH_empirical_fisher, ChenAllocator
 # ---------------------------
 # STE quantization
 # ---------------------------
@@ -75,30 +75,8 @@ def sinkhorn_log_diff(cost: torch.Tensor,
     return P
 
 # ---------------------------
-# Chen cost (MCKP quadratic) builder
-# ---------------------------
-
-def deltaL_cost_matrix(trH: List[float],   # tr(H_i) per layer
-                       wmax: List[float],  # max|w_i| per layer
-                       bits: List[int],
-                       device: torch.device,
-                       dtype=torch.float32) -> torch.Tensor:
-    """
-    C[i,j] = 0.5 * trH[i] * ((2*wmax[i]/(2^b-1))**2 / 12)
-    """
-    L, B = len(trH), len(bits)
-    tr = torch.tensor(trH, device=device, dtype=dtype).unsqueeze(1)   # [L,1]
-    w = torch.tensor(wmax, device=device, dtype=dtype).unsqueeze(1)   # [L,1]
-    denom = torch.tensor([float((1 << b) - 1) for b in bits], device=device, dtype=dtype).unsqueeze(0)  # [1,B]
-    delta = (2.0 * w) / denom  # [L,B]
-    sigma2 = (delta * delta) / 12.0
-    C = 0.5 * tr * sigma2
-    return C  # [L,B]
-
-# ---------------------------
 # Differentiable allocator (learns Θ and φ)
 # ---------------------------
-
 @dataclass
 class DynOTCfg:
     bits: List[int]
@@ -242,52 +220,6 @@ def wrap_model_with_ot_quant(model: nn.Module,
     _replace(model)
     return model
 
-# ---------------------------
-# Layer-wise tr(H) estimators
-# ---------------------------
-
-@torch.no_grad()
-def estimate_trH_empirical_fisher(model: nn.Module,
-                                  dataloader,
-                                  loss_callback: Callable[[nn.Module, Tuple, Dict], torch.Tensor],
-                                  device: torch.device,
-                                  batches: int = 1) -> Dict[str, float]:
-    """
-    Approximate tr(H_i) with sum of grad^2 (empirical Fisher diag sum) per layer.
-    """
-    model.train()
-    sens = {name: 0.0 for name, _ in util.iter_quant_layers(model)}
-    counts = {k: 0 for k in sens.keys()}
-
-    it = iter(dataloader)
-    for _ in range(batches):
-        try:
-            batch = next(it)
-        except StopIteration:
-            break
-        args, kwargs = (batch if isinstance(batch, (list, tuple)) else (batch,)), {}
-        # zero grads
-        for p in model.parameters():
-            if p.grad is not None: p.grad.zero_()
-        loss = loss_callback(model, args, kwargs)  # returns scalar loss
-        loss.backward()
-        for name, m in util.iter_quant_layers(model):
-            g2, n = 0.0, 0
-            for p in m.parameters():
-                if p.grad is None: continue
-                g2 += torch.sum(p.grad.detach()**2).item()
-                n += p.numel()
-            # use sum(grad^2) as trace proxy (no division by n)
-            sens[name] += g2
-            counts[name] += 1
-
-    # average over batches, clamp small
-    out = {}
-    for k, v in sens.items():
-        if counts[k] > 0:
-            v = v / counts[k]
-        out[k] = max(v, 1e-12)
-    return out
 
 # (Optional) Hutchinson estimator sketch (heavier; not fully optimized)
 def hutchinson_trH_step(model: nn.Module,
@@ -346,12 +278,11 @@ def forward_with_dynamic_bits(model: nn.Module,
     total = task_loss + budget_reg
     return total, {"task_loss": task_loss, "budget_reg": budget_reg, "P": P.detach().cpu()}
 
-def  sinkhorn_MCKP_allocate(model_ctor: Callable[[], nn.Module],
-                              train_loader: DataLoader, val_loader: DataLoader,device, 
-                              bits: List[int], avg_bits: float,
+def  sinkhorn_MCKP_allocate(base:nn.Module,
+                              train_loader: DataLoader, 
+                              device, bits: List[int], avg_bits: float,
                               steps: int = 50, lr: float = 1e-4,
                               chen: bool = False) -> Dict[str,int]:
-    base = model_ctor().to(device)
     # meta
     names, sizes = [], []
     for name, m in util.iter_quant_layers(base):
@@ -367,12 +298,12 @@ def  sinkhorn_MCKP_allocate(model_ctor: Callable[[], nn.Module],
         s_map = h2.empirical_fisher_sensitivity(base, train_loader, device, batches=2)
         alloc.update_sensitivity(s_map)
     # wrap model with mixture modules
-    model = model_ctor().to(device)
+
     if chen:
         # just reuse mixture layers using diff allocator for STE forward;
         # we can still read P from Chen allocator by injecting alloc._P before forward
         pass
-    model = wrap_model_with_ot_quant(model,alloc,bits).to(device)
+    model = wrap_model_with_ot_quant(base,alloc,bits).to(device)
     
     ce = nn.CrossEntropyLoss()
     opt = torch.optim.Adam(list(model.parameters()) + list(alloc.parameters()), lr=lr)

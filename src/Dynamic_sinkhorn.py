@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as F
 import HAWQ2_fisher as h2
 import util
+#import diff_sinkhorn as dOT
 
 class _RoundSTE(torch.autograd.Function):
     @staticmethod
@@ -38,6 +39,15 @@ def sinkhorn_log_diff(cost, a, b, epsilon=0.02, iters=200):
     P = torch.exp(K + f.unsqueeze(1) + g.unsqueeze(0))
     return P / (P.sum() + 1e-40)
 
+@dataclass
+class DynOTCfg:
+    bits: List[int]
+    epsilon: float = 0.02
+    iters: int = 200
+    avg_bits_target: float = 6.0     # soft budget target
+    budget_weight: float = 1e-3      # weight for (E[bits]-target)^2
+    entropy_weight: float = 0.0      # optional entropy on column b
+
 class DiffAllocator(nn.Module):
     def __init__(self, layer_names: List[str], layer_sizes: List[int], bits: List[int], device):
         super().__init__()
@@ -62,16 +72,138 @@ class DiffAllocator(nn.Module):
     def b(self): return F.softmax(self.phi, dim=0)
 
     def compute_P(self, eps=0.02, iters=200):
-        C = self.build_cost()
-        P = sinkhorn_log_diff(C - self.theta, self.a, self.b(), eps, iters)
-        return P
+        return sinkhorn_log_diff(self.build_cost() - self.theta, self.a, self.b(), eps, iters)
 
     def budget_reg(self, P, target_avg, weight):
         bits_t = torch.tensor(self.bits, dtype=P.dtype, device=P.device)
         Eb = torch.sum(self.a.unsqueeze(1) * P * bits_t.unsqueeze(0))
         return weight * (Eb - target_avg)**2
 
+class DifferentiableAllocator(DiffAllocator):
+    """
+    Learnable:
+      - theta: [L,B] bias that tilts assignment (acts like negative cost)
+      - phi:   [B]   controls column marginal b = softmax(phi)
+    Fixed:
+      - a: row marginal (size-weighted)
+      - bits: candidate bit-widths
+      - sens, n: build cost C = n*s*err(bits)
+    """
+    def __init__(self, layer_names: List[str], layer_sizes: List[int], bits: List[int], device: torch.device):
+        super().__init__(layer_names,layer_sizes,bits,device)
+        # self.layer_names = layer_names
+        # self.layer_sizes = layer_sizes
+        # self.bits = bits
+        # self.L = len(layer_names)
+        # self.B = len(bits)
+        # n = torch.tensor(layer_sizes, dtype=torch.float32, device=device)
+        # self.register_buffer("a", (n / n.sum()).detach())  # row marginal
+        # # learnable params
+        # self.theta = nn.Parameter(torch.zeros(self.L, self.B, device=device))
+        # self.phi = nn.Parameter(torch.zeros(self.B, device=device))  # b = softmax(phi)
+        # # buffers updated externally
+        # self.register_buffer("sens", torch.full((self.L,), 1.0/self.L, device=device))
+        # self.register_buffer("err", torch.tensor([2.0**(-2*b) for b in bits], dtype=torch.float32, device=device))
 
+    def column_marginal(self) -> torch.Tensor:
+        return F.softmax(self.phi, dim=0)  # [B]
+    
+    def compute_P(self, eps=0.02, iters=200):
+        b = self.column_marginal()        # [B], learnable
+        # bias theta enters as negative cost (larger theta -> prefer that cell)
+        C_eff = self.build_cost()  - self.theta            # differentiable wrt theta
+        return  sinkhorn_log_diff(C_eff, self.a, b, epsilon=eps, iters=iters)  # [L,B]
+
+    def budget_regularizer(self, P: torch.Tensor, cfg: DynOTCfg) -> torch.Tensor:
+        # Expected bits over "param mass" (use a as row weights)
+        bits_t = torch.tensor(self.bits, dtype=P.dtype, device=P.device)  # [B]
+        # per-layer expected bits: P[i]·b_vec, then weight by a[i]
+        Eb = torch.sum(self.a.unsqueeze(1) * P * bits_t.unsqueeze(0))
+        reg = cfg.budget_weight * (Eb - cfg.avg_bits_target)**2
+        if cfg.entropy_weight > 0:
+            b = self.column_marginal()
+            reg = reg - cfg.entropy_weight * (-(b * (b.clamp_min(1e-12)).log()).sum())
+        return reg
+
+class ChenDifferentiableAllocator(DiffAllocator):
+    """
+    Learnable:
+      - theta: [L,B] bias (negative cost) to tilt assignments
+      - phi:   [B]   column marginal b = softmax(phi)
+    Fixed/updated buffers:
+      - a: row marginal (size-weighted)
+      - trH: layer Hessian trace estimates (update periodically)
+      - wmax: layer max abs weights (update each step/epoch)
+    Cost:
+      C[i,j] = 0.5 * trH[i] * ( (2*wmax[i]/(2^b_j-1))^2 / 12 )
+      Then effective cost: C_eff = C - theta
+    """
+    def __init__(self, layer_names: List[str], layer_sizes: List[int], bits: List[int], device: torch.device):
+        super().__init__(layer_names,layer_sizes,bits,device)
+        self.layer_names = layer_names
+        self.layer_sizes = layer_sizes
+        self.bits = bits
+        self.L, self.B = len(layer_names), len(bits)
+        n = torch.tensor(layer_sizes, dtype=torch.float32, device=device)
+        self.register_buffer("a", (n / n.sum()).detach())
+        self.register_buffer("trH", torch.full((self.L,), 1.0, device=device))
+        self.register_buffer("wmax", torch.full((self.L,), 1.0, device=device))
+        # learnables
+        self.theta = nn.Parameter(torch.zeros(self.L, self.B, device=device))
+        self.phi = nn.Parameter(torch.zeros(self.B, device=device))
+
+    @torch.no_grad()
+    def update_trH(self, tr_map: Dict[str, float]):
+        vals = [max(float(tr_map[nm]), 1e-12) for nm in self.layer_names]
+        t = torch.tensor(vals, device=self.a.device, dtype=torch.float32)
+        self.trH.copy_(t)
+
+    @torch.no_grad()
+    def update_wmax_from_model(self, model: nn.Module):
+        vals = []
+        for nm in self.layer_names:
+            m = get_module_by_name(model, nm)
+            assert hasattr(m, "weight") and m.weight is not None
+            vals.append(float(m.weight.detach().abs().max().item()) + 1e-12)
+        self.wmax.copy_(torch.tensor(vals, device=self.a.device, dtype=torch.float32))
+
+    def build_cost(self) -> torch.Tensor:
+        return deltaL_cost_matrix(self.trH.tolist(), self.wmax.tolist(), self.bits, self.a.device, dtype=torch.float32)
+
+    def compute_P(self, cfg: DynOTCfg) -> Tuple[torch.Tensor, torch.Tensor]:
+        b = self.column_marginal()
+        C_eff = self.build_cost() - self.theta
+        P = sinkhorn_log_diff(C_eff, self.a, b, epsilon=cfg.epsilon, iters=cfg.iters)
+        return P, b
+
+    def budget_reg(self, P: torch.Tensor, cfg: DynOTCfg) -> torch.Tensor:
+        bits_t = torch.tensor(self.bits, dtype=P.dtype, device=P.device)  # [B]
+        Eb = torch.sum(self.a.unsqueeze(1) * P * bits_t.unsqueeze(0))     # expected bits (param-mass weighted)
+        reg = cfg.budget_weight * (Eb - cfg.avg_bits_target) ** 2
+        if cfg.entropy_weight > 0:
+            b = self.column_marginal()
+            reg = reg - cfg.entropy_weight * (-(b * (b.clamp_min(1e-12)).log()).sum())
+        return reg
+
+# ---------------------------
+# Chen cost (MCKP quadratic) builder
+# ---------------------------
+def deltaL_cost_matrix(trH: List[float],   # tr(H_i) per layer
+                       wmax: List[float],  # max|w_i| per layer
+                       bits: List[int],
+                       device: torch.device,
+                       dtype=torch.float32) -> torch.Tensor:
+    """
+    C[i,j] = 0.5 * trH[i] * ((2*wmax[i]/(2^b-1))**2 / 12)
+    """
+    L, B = len(trH), len(bits)
+    tr = torch.tensor(trH, device=device, dtype=dtype).unsqueeze(1)   # [L,1]
+    w = torch.tensor(wmax, device=device, dtype=dtype).unsqueeze(1)   # [L,1]
+    denom = torch.tensor([float((1 << b) - 1) for b in bits], device=device, dtype=dtype).unsqueeze(0)  # [1,B]
+    delta = (2.0 * w) / denom  # [L,B]
+    sigma2 = (delta * delta) / 12.0
+    C = 0.5 * tr * sigma2
+    return C  # [L,B]
 
 class OTQLinear(nn.Linear):
     def __init__(self, in_f, out_f, bias=True, idx=0, alloc: DiffAllocator=None, bits=None):
@@ -99,9 +231,9 @@ class OTQConv2d(nn.Conv2d):
 
 
 # Chen cost allocator (dynamic)
-class ChenAllocator(nn.Module):
+class ChenAllocator(DiffAllocator):
     def __init__(self, layer_names: List[str], layer_sizes: List[int], bits: List[int], device):
-        super().__init__()
+        super().__init__(layer_names,layer_sizes,bits,device)
         self.layer_names = layer_names; self.layer_sizes = layer_sizes; self.bits=bits
         self.L, self.B = len(layer_names), len(bits)
         n = torch.tensor(layer_sizes, dtype=torch.float32, device=device)
@@ -137,12 +269,10 @@ class ChenAllocator(nn.Module):
         denom = torch.tensor([(1<<b)-1 for b in self.bits], device=self.a.device, dtype=torch.float32).unsqueeze(0)  # [1,B]
         delta = 2.0*w/denom
         sigma2 = (delta*delta)/12.0
-        C = 0.5*tr*sigma2
-        return C
+        return 0.5*tr*sigma2
 
     def compute_P(self, eps=0.02, iters=200):
-        C = self.build_cost()
-        return sinkhorn_log_diff(C - self.theta, self.a, self.b(), eps, iters)
+        return sinkhorn_log_diff(self.build_cost() - self.theta, self.a, self.b(), eps, iters)
 
     def budget_reg(self, P, target_avg, weight):
         bits_t = torch.tensor(self.bits, dtype=P.dtype, device=P.device)
@@ -171,33 +301,36 @@ def wrap_with_mixture_modules(model: nn.Module, alloc: DiffAllocator, bits: List
     _rep(model); return model
 
 # Short QAT to learn allocator then harden
-def dynamic_sinkhorn_allocate(model_ctor: Callable[[], nn.Module],
-                              train_loader: DataLoader, val_loader: DataLoader,
+def dynamic_sinkhorn_allocate(base:nn.Module,
+                              train_loader: DataLoader, 
                               device, bits: List[int], avg_bits: float,
                               steps: int = 50, lr: float = 1e-4,
-                              chen: bool = False) -> Dict[str,int]:
-    base = model_ctor().to(device)
-    # meta
-    names, sizes = [], []
+                              chen: bool = False,
+                              MCKP=False) -> Dict[str,int]:
+    names, sizes = [],[] #list(zip( [name, m.weight.numel()] for name, m in util.iter_quant_layers(base)))
     for name, m in util.iter_quant_layers(base):
-        names.append(name); sizes.append(m.weight.numel())
+        names.append(name);  
+        sizes.append(m.weight.numel())
+
     # allocator
     if chen:
-        alloc = ChenAllocator(names, sizes, bits, device).to(device)
+        if(MCKP):
+            alloc = ChenDifferentiableAllocator(names, sizes, bits, device).to(device)
+        else:
+            alloc = ChenAllocator(names, sizes, bits, device).to(device)
         # initial trH
-        tr_map = estimate_trH_empirical_fisher(base, train_loader, device, batches=2)
-        alloc.update_trH(tr_map)
-    else:
-        alloc = DiffAllocator(names, sizes, bits, device).to(device)
-        s_map = h2.empirical_fisher_sensitivity(base, train_loader, device, batches=2)
-        alloc.update_sensitivity(s_map)
-    # wrap model with mixture modules
-    model = model_ctor().to(device)
-    if chen:
+        alloc.update_trH(estimate_trH_empirical_fisher(base, train_loader, device, batches=2))
         # just reuse mixture layers using diff allocator for STE forward;
         # we can still read P from Chen allocator by injecting alloc._P before forward
-        pass
-    model = wrap_with_mixture_modules(model, alloc if not chen else alloc, bits).to(device)
+    else:
+        if(MCKP):
+            alloc = DifferentiableAllocator(names, sizes, bits, device).to(device)
+        else:
+            alloc = DiffAllocator(names, sizes, bits, device).to(device)
+        alloc.update_sensitivity(h2.empirical_fisher_sensitivity(base, train_loader, device, batches=2))
+
+    model = base.to(device)
+    model = wrap_with_mixture_modules(model, alloc, bits).to(device)
 
     ce = nn.CrossEntropyLoss()
     opt = torch.optim.Adam(list(model.parameters()) + list(alloc.parameters()), lr=lr)
@@ -210,8 +343,9 @@ def dynamic_sinkhorn_allocate(model_ctor: Callable[[], nn.Module],
         opt.zero_grad()
         # refresh stats
         if chen: alloc.update_wmax_from_model(model)
-        # compute P
         P = alloc.compute_P(eps=0.02, iters=150)
+        if(P is None):
+            print(f"P is None, alloc is {type(alloc)}");exit()
         alloc._P = P  # inject
         logits = model(x)
         loss = ce(logits, y)

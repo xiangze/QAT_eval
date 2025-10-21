@@ -42,7 +42,7 @@ def apply_assignment_inplace(model: nn.Module, assignment: Dict[str, int]) -> Di
     """
     backup = {}
     with torch.no_grad():
-        for name, m in util.util.iter_quant_layers(model):
+        for name, m in util.iter_quant_layers(model):
             b = assignment.get(name, None)
             if b is None: continue
             if hasattr(m, "weight") and m.weight is not None:
@@ -271,18 +271,21 @@ def run(args):
             "mean_bits": mbits,
             "assignment_csv": csv_path
         })
-        # restore (not needed since we use fresh qmodel each time)
-        # restore_from_backup(qmodel, backup)
+    if(args.restore):# restore (not needed since we use fresh qmodel each time)
+        backup = apply_assignment_inplace(qmodel, assignment)
+        restore_from_backup(qmodel, backup)
 
     # dump summary
+    info={  "method":meth,
+        "fp32": {"acc": base_acc, "size_MB": base_size},
+        "bits": args.bits, "avg_bits": args.avg_bits,
+        "results": results
+        }
+
     with open(os.path.join(args.out_dir, "summary.json"), "w") as f:
-        json.dump({
-            "fp32": {"acc": base_acc, "size_MB": base_size},
-            "bits": args.bits, "avg_bits": args.avg_bits,
-            "results": results
-        }, f, indent=2)
+        json.dump(info, f, indent=2)
     print("\n=== Summary ===")
-    print(json.dumps({"fp32":{"acc":base_acc,"size_MB":base_size},"results":results}, indent=2))
+    print(json.dumps(info, indent=2))
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -290,7 +293,7 @@ def parse_args():
     p.add_argument("--cpu", action="store_true")
     # data options
     p.add_argument("--train_cifar10", action="store_true", help="train on CIFAR10 quickly instead of using torchvision pretrained")
-    p.add_argument("--train_epochs", type=int, default=2)
+    p.add_argument("--train_epochs", type=int, default=20)
     p.add_argument("--imagenet_val", type=str, default="", help="path to ImageNet val dir if evaluating torchvision pretrained")
     p.add_argument("--batch", type=int, default=128)
     p.add_argument("--workers", type=int, default=4)
@@ -304,16 +307,17 @@ def parse_args():
     p.add_argument("--bits", type=int, nargs="+", default=[2,4,6,8])
     p.add_argument("--avg_bits", type=float, default=6.0)
     p.add_argument("--sens_batches", type=int, default=2)
-
     # sinkhorn
     p.add_argument("--sinkhorn_eps", type=float, default=0.02)
     p.add_argument("--sinkhorn_iters", type=int, default=400)
-
     # dynamic
     p.add_argument("--dynamic_steps", type=int, default=50)
     p.add_argument("--dynamic_lr", type=float, default=1e-4)
 
     p.add_argument("--out_dir", type=str, default="./quant_results")
+    p.add_argument("--debug", action="store_true")
+    p.add_argument("--restore", action="store_true")
+    p.add_argument("--chen", action="store_true")
     return p.parse_args()
 
 if __name__ == "__main__":
