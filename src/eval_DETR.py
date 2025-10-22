@@ -258,7 +258,7 @@ def main():
     else:
         calib_ds = RandomDetrCalibDataset(size=args.calib_size)
 
-    dl = DataLoader(calib_ds, batch_size=args.batch, shuffle=False, collate_fn=detr_collate_fn)
+    tl = DataLoader(calib_ds, batch_size=args.batch, shuffle=False, collate_fn=detr_collate_fn)
 
     # --- モデル ---
     if not args.use_hf:
@@ -269,26 +269,32 @@ def main():
         model = DETRWithLoss(base).to(device)
     else:
         model = build_hf_detr_wrapper(device)
+    #学習
 
     # --- 量子化設定 & 実行 ---
-    cfg = q.OTQuantConfig(
-        bits=args.bits,
-        avg_bits=args.avg_bits,
-        epsilon=0.02,
-        sinkhorn_iters=args.sinkhorn_iters,
-        sens_batches=args.sens_batches,
-        # 量子化ユーティリティに除外フックがあるなら活用推奨:
-        # exclude_types=[nn.LayerNorm, nn.Embedding],
-        # exclude_names=[".*pos_embed.*", ".*query_embed.*"],
-    )
+    if(args.basicq):
+        cfg = q.OTQuantConfig(
+            bits=args.bits,
+            avg_bits=args.avg_bits,
+            epsilon=0.02,
+            sinkhorn_iters=args.sinkhorn_iters,
+            sens_batches=args.sens_batches,
+            # 量子化ユーティリティに除外フックがあるなら活用推奨:
+            # exclude_types=[nn.LayerNorm, nn.Embedding],
+            # exclude_names=[".*pos_embed.*", ".*query_embed.*"],
+        )
 
-    result = ot.ot_allocate_bits_for_model(model, dl, loss_fn, device, cfg)  # type: ignore[name-defined]
+        result = ot.ot_allocate_bits_for_model(model, tl, loss_fn, device, cfg)  # type: ignore[name-defined]
 
-    # ラッパー (model) に対して量子化適用（base を直接渡すと名前がずれる場合があるため注意）
-    backup = q.apply_weight_quantization_inplace(model, result.assignment, cfg.bits, keep_original=True)
+        # ラッパー (model) に対して量子化適用（base を直接渡すと名前がずれる場合があるため注意）
+        if(args.restore):
+            backup = q.apply_weight_quantization_inplace(model, result.assignment, cfg.bits, keep_original=True)
+            q.restore_from_backup(model, backup)
 
-    # レポート
-    report(result,cfg)
+        report(result,cfg)
+    else:
+        q.dumpresults(args,model_ctor=model,qmodel=model,device=device,val_loader=tl,
+                     methods=["HAWQ2_fisher","OT_HAWQ_like","DiffSinkhornDynamic","SinkhornMCKPDynamic"], dump=False)
 
     # 参考: 推論時は model.base をそのまま使用（weights は量子化後のものに置換済み）
     # model.base.eval(); predictions = model.base([image_tensor])

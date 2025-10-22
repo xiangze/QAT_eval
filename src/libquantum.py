@@ -82,3 +82,64 @@ def restore_weights_from_backup(model: nn.Module, backup: Dict[str, torch.Tensor
                 else:
                     mod = getattr(mod, attr)
             getattr(mod, param_name).data.copy_(tensor)
+
+from eval_methods_basic import apply_assignment_inplace,evaluate_top1,quantized_weight_size_mb,mean_bits,save_assignment_csv,model_fp32_size_mb,restore_from_backup
+import HAWQ2_fisher as h2
+import sinkhorn_fisher as OT
+import Dynamic_sinkhorn as Dyns
+import os
+import json
+
+# Apply MPQ methods
+def dumpresults(args, model_ctor,orgmodel,device,val_loader,
+                methods:list=["HAWQ2_fisher","OT_HAWQ_like","DiffSinkhornDynamic","SinkhornMCKPDynamic"],
+                dump=False):
+    ## Baseline FP32
+    base_acc = evaluate_top1(orgmodel, val_loader, device)
+    base_size = model_fp32_size_mb(orgmodel)
+    print(f"[FP32] acc={base_acc:.2f}%  size={base_size:.2f} MB")
+
+    results = []
+    for meth in methods:
+        print(f"\n=== [{meth}] ===")
+        # fresh copy
+        qmodel = model_ctor().to(device)
+        # build assignment
+        if meth == "HAWQ2_fisher":
+            assignment = h2.hawq2_fisher_allocate(qmodel, val_loader, device, args.bits, args.avg_bits, batches=args.sens_batches)
+        elif meth == "OT_HAWQ_like":
+            assignment = OT.ot_hawq_like_allocate(qmodel, val_loader, device, args.bits, args.avg_bits,
+                                               sens_batches=args.sens_batches, eps=args.sinkhorn_eps, iters=args.sinkhorn_iters)
+        elif "Sinkhorn"in meth :
+            assignment = Dyns.dynamic_sinkhorn_allocate(qmodel, val_loader, device, args.bits, args.avg_bits,
+                                                   steps=args.dynamic_steps, lr=args.dynamic_lr, chen=args.chen,MCKP=("MCKP" in meth))
+        else:
+            raise ValueError(meth)
+
+        # apply quantization in-place
+        acc = evaluate_top1(qmodel, val_loader, device)
+        qsize = quantized_weight_size_mb(qmodel, assignment, include_bias_fp32=True)
+        mbits = mean_bits(assignment, qmodel)
+        print(f"[{meth}] acc={acc:.2f}%  size={qsize:.2f} MB  mean_bits≈{mbits:.2f}")
+        # save assignment
+        csv_path = os.path.join(args.out_dir, f"{meth}_assignment.csv")
+        save_assignment_csv(csv_path, assignment, qmodel)
+        results.append({
+            "method": meth,
+            "acc": acc,
+            "size_MB": qsize,
+            "mean_bits": mbits,
+            "assignment_csv": csv_path
+        })
+
+        if(args.restore):# restore (not needed since we use fresh qmodel each time)
+            backup = apply_assignment_inplace(qmodel, assignment)
+            restore_from_backup(qmodel, backup)
+
+    if(dump):
+        with open(os.path.join(args.out_dir, "summary.json"), "w") as f:
+            json.dump(results, f, indent=2)
+        print("\n=== Summary ===")
+        print(json.dumps(results, indent=2))
+
+    return results
