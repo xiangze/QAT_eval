@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import datasets, transforms, models
 from torch.utils.data import DataLoader
-import util
+import qutil
 import libquantum as q
 import HAWQ2_fisher as h2
 # ----------------------------------------
@@ -38,7 +38,7 @@ def layer_sensitivity_empirical_fisher(
     1〜数バッチで十分な相対比較になることが多い。
     """
     model.train()
-    sens = {name: 0.0 for name, _ in util.iter_quant_layers(model)}
+    sens = {name: 0.0 for name, _ in qutil.iter_quant_layers(model)}
     counts = {name: 0 for name in sens.keys()}
 
     n_used = 0
@@ -54,7 +54,7 @@ def layer_sensitivity_empirical_fisher(
         loss.backward()
 
         # accumulate grad^2 per layer (weights only)
-        for name, m in util.iter_quant_layers(model):
+        for name, m in qutil.iter_quant_layers(model):
             g2_sum = 0.0
             n = 0
             for p in m.parameters():
@@ -238,7 +238,7 @@ def ot_allocate_bits_for_model(
     sens = layer_sensitivity_empirical_fisher(model, dataloader, loss_fn, device, num_batches=config.sens_batches)
 
     # 2) レイヤ情報
-    pairs = [(name, util.param_count(m)) for name, m in util.iter_quant_layers(model)]
+    pairs = [(name, qutil.param_count(m)) for name, m in qutil.iter_quant_layers(model)]
     layer_names, layer_sizes = (list(t) for t in zip(*pairs))
 
     L = len(layer_names)
@@ -266,7 +266,7 @@ def ot_allocate_bits_for_model(
 
 def build_cost_sens_size_pow2(model: nn.Module, sens: Dict[str,float], bits: List[int], device) -> Tuple[torch.Tensor,List[str],List[int]]:
     names, sizes = [], []
-    for name, m in util.iter_quant_layers(model):
+    for name, m in qutil.iter_quant_layers(model):
         names.append(name)
         sizes.append(m.weight.numel())
     s = torch.tensor([sens[nm] for nm in names], dtype=torch.float64, device=device)

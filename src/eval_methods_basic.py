@@ -24,7 +24,7 @@ import HAWQ2_fisher as h2
 import sinkhorn_fisher as OT
 import MCKP_sinkhorn as MCKPs
 import Dynamic_sinkhorn as Dyns
-import util
+import qutil
 
 def quantize_weight_per_tensor_symmetric(w: torch.Tensor, bits: int) -> torch.Tensor:
     if bits >= 32:
@@ -42,7 +42,7 @@ def apply_assignment_inplace(model: nn.Module, assignment: Dict[str, int]) -> Di
     """
     backup = {}
     with torch.no_grad():
-        for name, m in util.iter_quant_layers(model):
+        for name, m in qutil.iter_quant_layers(model):
             b = assignment.get(name, None)
             if b is None: continue
             if hasattr(m, "weight") and m.weight is not None:
@@ -70,7 +70,7 @@ def quantized_weight_size_mb(model: nn.Module, assignment: Dict[str, int], inclu
     Size = sum_i (weight_params_i * b_i) + (optional) bias in 32-bit.
     """
     total_bits = 0
-    for name, m in util.iter_quant_layers(model):
+    for name, m in qutil.iter_quant_layers(model):
         b = assignment.get(name, None)
         if b is None: b = 32
         w_params = m.weight.numel() if hasattr(m, "weight") and m.weight is not None else 0
@@ -81,8 +81,8 @@ def quantized_weight_size_mb(model: nn.Module, assignment: Dict[str, int], inclu
 
 def save_assignment_csv(path: str, assignment: Dict[str, int], model: nn.Module):
     rows = []
-    for name, m in util.iter_quant_layers(model):
-        rows.append([name, util.param_count(m), assignment.get(name, 32)])
+    for name, m in qutil.iter_quant_layers(model):
+        rows.append([name, qutil.param_count(m), assignment.get(name, 32)])
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["layer_name", "param_count", "bits"])
@@ -91,7 +91,7 @@ def save_assignment_csv(path: str, assignment: Dict[str, int], model: nn.Module)
 def mean_bits(assignment: Dict[str, int], model: nn.Module) -> float:
     num = 0
     den = 0
-    for name, m in util.iter_quant_layers(model):
+    for name, m in qutil.iter_quant_layers(model):
         b = assignment.get(name, 32)
         n = m.weight.numel() if hasattr(m, "weight") and m.weight is not None else 0
         num += b * n
@@ -176,7 +176,16 @@ def evaluate_top1(model: nn.Module, loader: DataLoader, device) -> float:
     corr = 0
     total = 0
     for x,y in loader:
-        x,y = x.to(device), y.to(device)
+        try:
+            x =x.to(device)
+            y =y.to(device)
+        except:
+            x={k:v.to(device)for k, v in x.items()}
+            y =y.to(device)
+            for k, v in x.items():
+                print(k,v.shape)
+            print("y",y)
+            exit()
         logits = model(x)
         pred = logits.argmax(dim=1)
         corr += (pred == y).sum().item()

@@ -4,7 +4,7 @@ DETR に OT ベースの混合精度量子化（重みのみ）をそのまま�
 ポイント:
 - 既存の `ot_allocate_bits_for_model(model, dl, loss_fn, device, cfg)` のインターフェースを変えずに DETR を扱えるよう
   モデル側で "loss を返す" ラッパーを被せ、`loss_fn=lambda loss, _ : loss` にする。
-- torchvision DETR を優先採用。見つからない場合は Hugging Face DETR で同様に動くラッパーを用意（任意）。
+- torchvision DETR を優先採用。見つからない場合は Hugging Face DETR で同様に動くラッパーを用意
 - 校正データは COCO があれば理想だが、最小動作のためにランダム矩形の合成データセットも同梱。
 
 前提:
@@ -38,13 +38,14 @@ from typing import List, Tuple, Dict, Any
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader,random_split
 from torchvision import transforms
 
 import libquantum as q
 import HAWQ2_fisher as h2
 import sinkhorn_fisher as ot
 
+from torchvision.datasets import CocoDetection
 # -----------------------------
 # 合成 DETR 校正データセット
 # -----------------------------
@@ -113,15 +114,15 @@ def detr_collate_fn(batch: List[Tuple[torch.Tensor, Dict[str, torch.Tensor]]]):
 # DETR 構築（torchvision 優先 / HF 代替）
 # -----------------------------
 
-def build_torchvision_detr(pretrained: bool = True) -> nn.Module | None:
-    try:
-        from torchvision.models.detection import detr_resnet50, Detr_ResNet50_Weights
-        weights = Detr_ResNet50_Weights.DEFAULT if pretrained else None
-        model = detr_resnet50(weights=weights)
-        return model
-    except Exception:
-        return None
-
+# def build_torchvision_detr(pretrained: bool = True) -> nn.Module | None:
+#     try:
+#         #from torchvision.models.detection import detr_resnet50, Detr_ResNet50_Weights
+#         #weights = Detr_ResNet50_Weights.DEFAULT if pretrained else None
+#         #model = detr_resnet50(weights=weights)
+#         model = torch.hub.load('facebookresearch/detr', 'detr_resnet50', pretrained=True)
+#         return model
+#     except Exception:
+#         return None
 
 class DETRWithLoss(nn.Module):
     """torchvision DETR を loss スカラーを返す形でラップ。
@@ -155,7 +156,6 @@ def build_hf_detr_wrapper(device: torch.device):
     """
     from transformers import DetrForObjectDetection, DetrImageProcessor
     from torchvision.transforms import ToPILImage
-
     model = DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50").to(device)
     processor = DetrImageProcessor.from_pretrained("facebook/detr-resnet-50")
 
@@ -220,6 +220,27 @@ class CocoAsDetr(Dataset):
     def __getitem__(self, i):
         return coco_to_detr(self.base[i])
     
+def make_train_eval_coco(args, train_ratio=0.9):
+    """
+    args.coco_img : COCO images path
+    args.coco_ann : COCO annotations path
+    args.calib_size : optional, max size for calibration dataset
+    """
+    # COCO detection dataset
+    base_ds = CocoDetection(args.coco_img, args.coco_ann, transforms=None)
+    # --- Train/Eval Split ---
+    total = len(base_ds)
+    train_size = int(total * train_ratio)
+    eval_size = total - train_size
+
+    base_train_ds, base_eval_ds = random_split(base_ds, [train_size, eval_size])
+
+    # --- Wrap each with CocoAsDetr ---
+    train_ds = CocoAsDetr(base_train_ds)
+    eval_ds  = CocoAsDetr(base_eval_ds)
+
+    return train_ds, eval_ds
+    
 # 出力がスカラー損失なので loss_fn はそれをそのまま返す
 def loss_fn(loss_scalar: torch.Tensor, _dummy_target: Any) -> torch.Tensor:
     return loss_scalar
@@ -241,28 +262,37 @@ def main():
     ap.add_argument("--coco-ann", type=str, default=None, help="COCO annotations JSON (instances_val2017.json など)")
     ap.add_argument("--calib-size", type=int, default=32)
     ap.add_argument("--batch", type=int, default=2)
-    ap.add_argument("--avg-bits", type=float, default=6.0)
+    ap.add_argument("--avg_bits", type=float, default=6.0)
     ap.add_argument("--bits", type=int, nargs="*", default=[2, 4, 6, 8])
     ap.add_argument("--sinkhorn-iters", type=int, default=400)
-    ap.add_argument("--sens-batches", type=int, default=2)
+    ap.add_argument("--sens_batches", type=int, default=2)
+    ap.add_argument("--out_dir",      type=str, default="./quant_results_detr")
+    ap.add_argument("--basicq", action="store_true")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if args.coco_img and args.coco_ann:
         # 任意: 本番は COCO を推奨（インストール要: pycocotools）
-        from torchvision.datasets import CocoDetection
         tfm = None  # DETR は内部でサイズ正規化するためここでは生画像でも可
-        ds = CocoDetection(args.coco_img, args.coco_ann, transforms=tfm)
-        calib_ds = CocoAsDetr(ds, args.calib_size)
+        if(args.train==""):
+            ds = CocoDetection(args.coco_img, args.coco_ann, transforms=tfm)
+            calib_ds = CocoAsDetr(ds, args.calib_size)
+            el = DataLoader(calib_ds, batch_size=args.batch, shuffle=False, collate_fn=detr_collate_fn)                        
+            tl=None
+        else:
+            train_ds, eval_ds = make_train_eval_coco(args)
+            tl = DataLoader(train_ds, batch_size=args.batch, shuffle=True, collate_fn=detr_collate_fn)
+            el = DataLoader(eval_ds, batch_size=args.batch, shuffle=False, collate_fn=detr_collate_fn)
     else:
         calib_ds = RandomDetrCalibDataset(size=args.calib_size)
-
-    tl = DataLoader(calib_ds, batch_size=args.batch, shuffle=False, collate_fn=detr_collate_fn)
+        el = DataLoader(calib_ds, batch_size=args.batch, shuffle=True, collate_fn=detr_collate_fn)
+        #el = DataLoader(calib_ds, batch_size=args.batch, shuffle=True)
+        tl=None
 
     # --- モデル ---
     if not args.use_hf:
-        base = build_torchvision_detr(pretrained=True)
+        base = torch.hub.load('facebookresearch/detr', 'detr_resnet50', pretrained=True) 
         if base is None:
             print("[WARN] torchvision DETR が見つかりません。--use-hf を付けるか torchvision を更新してください。")
             return
@@ -293,8 +323,8 @@ def main():
 
         report(result,cfg)
     else:
-        q.dumpresults(args,model_ctor=model,qmodel=model,device=device,val_loader=tl,
-                     methods=["HAWQ2_fisher","OT_HAWQ_like","DiffSinkhornDynamic","SinkhornMCKPDynamic"], dump=False)
+        q.dumpresults(args,model_ctor=model,orgmodel=model,device=device,val_loader=el,train_loader=tl,
+                     methods=["HAWQ2_fisher","OT_HAWQ_like","DiffSinkhornDynamic","SinkhornMCKPDynamic"], dump=True)
 
     # 参考: 推論時は model.base をそのまま使用（weights は量子化後のものに置換済み）
     # model.base.eval(); predictions = model.base([image_tensor])

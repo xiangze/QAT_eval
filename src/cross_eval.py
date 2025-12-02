@@ -16,7 +16,6 @@ from torchvision.models import get_model_weights
 import HAWQ2_fisher as h2
 import sinkhorn_fisher as OT
 import Dynamic_sinkhorn as Dyns
-import util
 import json
 from eval_methods_basic import apply_assignment_inplace,evaluate_top1,quantized_weight_size_mb,mean_bits,save_assignment_csv,model_fp32_size_mb,restore_from_backup
 

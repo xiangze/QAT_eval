@@ -13,7 +13,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import util
+import qutil
 import libquantum as q
 # -------------------------------
 # Critical-category logit/label transform (classification-friendly)
@@ -95,7 +95,7 @@ def fisher_sensitivity_mixed_objective(
     s_i = E_batch[ mean( grad_i(alpha*LA + LF)^2 ) ] を層毎に推定。
     """
     model.train()
-    sens = {name: 0.0 for name, _ in util.iter_quant_layers(model)}
+    sens = {name: 0.0 for name, _ in qutil.iter_quant_layers(model)}
     counts = {name: 0 for name in sens.keys()}
     exclude_layer_name_contains = exclude_layer_name_contains or []
 
@@ -118,7 +118,7 @@ def fisher_sensitivity_mixed_objective(
         mixed = alpha * LA + LF
         mixed.backward()
 
-        for name, m in util.iter_quant_layers(model):
+        for name, m in qutil.iter_quant_layers(model):
             if any(kw in name for kw in exclude_layer_name_contains):
                 continue
             g2_sum = 0.0
@@ -316,9 +316,9 @@ def allocate_bits_sinkhorn_fisher(
 
     # 2) layer meta
     layer_names, layer_sizes = [], []
-    for name, m in util.iter_quant_layers(model):
+    for name, m in qutil.iter_quant_layers(model):
         layer_names.append(name)
-        layer_sizes.append(util.param_count(m))
+        layer_sizes.append(qqutil.param_count(m))
 
     # 3) cost and marginals
     C, a, nvec, total_params = build_cost_and_marginals(

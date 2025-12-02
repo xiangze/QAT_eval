@@ -13,7 +13,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import util
+import qutil
 from torch.utils.data import DataLoader
 import diff_sinkhorn as dOT
 import HAWQ2_fisher as h2
@@ -241,7 +241,7 @@ def hutchinson_trH_step(model: nn.Module,
     # accumulate per layer: sum(H_ii) ≈ v ⊙ (Hv) summed over params
     traces = {}
     idx = 0
-    for name, m in util.iter_quant_layers(model):
+    for name, m in qutil.iter_quant_layers(model):
         layer_params = [p for p in m.parameters() if p.requires_grad]
         n_elems = sum(p.numel() for p in layer_params)
         # map hvp/grads slices accordingly
@@ -285,7 +285,7 @@ def  sinkhorn_MCKP_allocate(base:nn.Module,
                               chen: bool = False) -> Dict[str,int]:
     # meta
     names, sizes = [], []
-    for name, m in util.iter_quant_layers(base):
+    for name, m in qutil.iter_quant_layers(base):
         names.append(name); sizes.append(m.weight.numel())
     # allocator
     if chen:
@@ -365,9 +365,9 @@ if __name__ == "__main__":
 
         # Layer meta
         layer_names, layer_sizes = [], []
-        for name, mod in util.iter_quant_layers(model):
+        for name, mod in qutil.iter_quant_layers(model):
             layer_names.append(name)
-            layer_sizes.append(util.param_count(mod))
+            layer_sizes.append(qutil.param_count(mod))
 
         bits = [2,4,6,8]
         alloc = ChenDifferentiableAllocator(layer_names, layer_sizes, bits, device).to(device)

@@ -4,12 +4,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-import util 
+import qutil 
 
 def empirical_fisher_sensitivity(model: nn.Module, loader: DataLoader, device, batches=1) -> Dict[str, float]:
     ce = nn.CrossEntropyLoss()
     model.train()
-    sens = {name: 0.0 for name, _ in util.iter_quant_layers(model)}
+    sens = {name: 0.0 for name, _ in qutil.iter_quant_layers(model)}
     counts = {k: 0 for k in sens.keys()}
     it = iter(loader)
     for _ in range(batches):
@@ -21,7 +21,7 @@ def empirical_fisher_sensitivity(model: nn.Module, loader: DataLoader, device, b
         logits = model(x)
         loss = ce(logits, y)
         loss.backward()
-        for name, m in util.iter_quant_layers(model):
+        for name, m in qutil.iter_quant_layers(model):
             g2, n = 0.0, 0
             for p in m.parameters():
                 if p.grad is None: continue
@@ -72,7 +72,7 @@ def greedy_rounding_assignment(capacities,bits,items):
 def hawq2_fisher_allocate(model: nn.Module, loader: DataLoader, device,
                           bits: List[int], avg_bits: float, batches=1) -> Dict[str,int]:
     sens = empirical_fisher_sensitivity(model, loader, device, batches=batches)
-    items =[(name, sens[name], m.weight.numel()) if (hasattr(m,"weight") and m.weight is not None) else (name, sens[name], 0) for name, m in util.iter_quant_layers(model) ]
+    items =[(name, sens[name], m.weight.numel()) if (hasattr(m,"weight") and m.weight is not None) else (name, sens[name], 0) for name, m in qutil.iter_quant_layers(model) ]
     # importance score: s_i * n_i
     items.sort(key=lambda x: x[1]*x[2], reverse=True)
     # target param-mass per bit

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 import HAWQ2_fisher as h2
-import util
+import qutil
 #import diff_sinkhorn as dOT
 
 class _RoundSTE(torch.autograd.Function):
@@ -55,8 +55,10 @@ class DiffAllocator(nn.Module):
         self.L, self.B = len(layer_names), len(bits)
         n = torch.tensor(layer_sizes, dtype=torch.float32, device=device)
         self.register_buffer("a", (n/n.sum()).detach())
+        # # learnable params
         self.theta = nn.Parameter(torch.zeros(self.L, self.B, device=device))
         self.phi = nn.Parameter(torch.zeros(self.B, device=device))
+        # # buffers updated externally
         self.register_buffer("sens", torch.full((self.L,), 1.0/self.L, device=device))
         self.register_buffer("err", torch.tensor([2.0**(-2*b) for b in bits], dtype=torch.float32, device=device))
 
@@ -98,10 +100,8 @@ class DifferentiableAllocator(DiffAllocator):
         # self.B = len(bits)
         # n = torch.tensor(layer_sizes, dtype=torch.float32, device=device)
         # self.register_buffer("a", (n / n.sum()).detach())  # row marginal
-        # # learnable params
         # self.theta = nn.Parameter(torch.zeros(self.L, self.B, device=device))
         # self.phi = nn.Parameter(torch.zeros(self.B, device=device))  # b = softmax(phi)
-        # # buffers updated externally
         # self.register_buffer("sens", torch.full((self.L,), 1.0/self.L, device=device))
         # self.register_buffer("err", torch.tensor([2.0**(-2*b) for b in bits], dtype=torch.float32, device=device))
 
@@ -307,8 +307,8 @@ def dynamic_sinkhorn_allocate(base:nn.Module,
                               steps: int = 50, lr: float = 1e-4,
                               chen: bool = False,
                               MCKP=False) -> Dict[str,int]:
-    names, sizes = [],[] #list(zip( [name, m.weight.numel()] for name, m in util.iter_quant_layers(base)))
-    for name, m in util.iter_quant_layers(base):
+    names, sizes = [],[] #list(zip( [name, m.weight.numel()] for name, m in qutil.iter_quant_layers(base)))
+    for name, m in qutil.iter_quant_layers(base):
         names.append(name);  
         sizes.append(m.weight.numel())
 
@@ -369,7 +369,7 @@ def dynamic_sinkhorn_allocate(base:nn.Module,
 def estimate_trH_empirical_fisher(model: nn.Module, loader: DataLoader, device, batches=1) -> Dict[str,float]:
     ce = nn.CrossEntropyLoss()
     model.train()
-    sens = {name: 0.0 for name,_ in util.iter_quant_layers(model)}
+    sens = {name: 0.0 for name,_ in qutil.iter_quant_layers(model)}
     counts = {k:0 for k in sens.keys()}
     it = iter(loader)
     for _ in range(batches):
@@ -380,7 +380,7 @@ def estimate_trH_empirical_fisher(model: nn.Module, loader: DataLoader, device, 
             if p.grad is not None: p.grad.zero_()
         logits = model(x); loss = ce(logits, y)
         loss.backward()
-        for name, m in util.iter_quant_layers(model):
+        for name, m in qutil.iter_quant_layers(model):
             g2 = 0.0
             for p in m.parameters():
                 if p.grad is None: continue

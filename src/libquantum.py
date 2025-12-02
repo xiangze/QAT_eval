@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Iterable, Optional
 import torch
 import torch.nn as nn
-import util
+import qutil
 
 @dataclass
 class QuantAssignment:
@@ -54,7 +54,7 @@ def apply_weight_quantization_inplace(
     backup = {}
     name2bit = {name: bits[idx] for name, idx in zip(assignment.layer_names, assignment.bit_indices)}
 
-    for name, m in util.iter_quant_layers(model):
+    for name, m in qutil.iter_quant_layers(model):
         b = name2bit.get(name, None)
         if b is None:
             continue
@@ -87,11 +87,12 @@ from eval_methods_basic import apply_assignment_inplace,evaluate_top1,quantized_
 import HAWQ2_fisher as h2
 import sinkhorn_fisher as OT
 import Dynamic_sinkhorn as Dyns
+import MCKP_sinkhorn as MCKPs
 import os
 import json
 
 # Apply MPQ methods
-def dumpresults(args, model_ctor,orgmodel,device,val_loader,
+def dumpresults(args, model_ctor,orgmodel,device,val_loader,train_loader,
                 methods:list=["HAWQ2_fisher","OT_HAWQ_like","DiffSinkhornDynamic","SinkhornMCKPDynamic"],
                 dump=False):
     ## Baseline FP32
@@ -113,6 +114,17 @@ def dumpresults(args, model_ctor,orgmodel,device,val_loader,
         elif "Sinkhorn"in meth :
             assignment = Dyns.dynamic_sinkhorn_allocate(qmodel, val_loader, device, args.bits, args.avg_bits,
                                                    steps=args.dynamic_steps, lr=args.dynamic_lr, chen=args.chen,MCKP=("MCKP" in meth))
+        elif meth == "OT_Fisher_Critical":
+            assignment = OT.ot_fisher_critical_allocate(qmodel, val_loader, device, args.bits, args.avg_bits,
+                                                     sens_batches=args.sens_batches, critical_ids=None)
+        elif meth == "DiffSinkhornDynamic":
+            assignment = Dyns.dynamic_sinkhorn_allocate(model_ctor, train_loader if args.train_cifar10 else val_loader,
+                                                   val_loader, device, args.bits, args.avg_bits,
+                                                   steps=args.dynamic_steps, lr=args.dynamic_lr, chen=False)
+        elif meth == "SinkhornMCKPDynamic":
+            assignment = MCKPs.sinkhorn_MCKP_allocate(model_ctor, train_loader if args.train_cifar10 else val_loader,
+                                                   val_loader, device, args.bits, args.avg_bits,
+                                                   steps=args.dynamic_steps, lr=args.dynamic_lr, chen=True)
         else:
             raise ValueError(meth)
 

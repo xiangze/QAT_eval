@@ -12,6 +12,13 @@
 
 > python eval_quant_methods.py --train_cifar10 --bits 2 4 8 --avg_bits 4.5 --dynamic_steps 80
 
+比較評価
+
+> python cross_eval.py
+
+DETRを対象とした比較評価
+
+> python eval_DETR.py
 
 # comment
 - 重みのみ（per-tensor）量子化。精度を突き詰めるには activation 量子化や ACIQ/LSQ によるクリッピング推定、per-channel 量子化の追加を推奨。
@@ -28,3 +35,4 @@
 DETR系で使う 1対1対応 の割り当て（バイパーティトマッチング）手法。各予測クエリと各GT（＋不要分の“空集合”）のコスト行列を作り、総コスト最小になる対応を見つける。
 - クリティカル
 重要クラスだけ特に落としたくない”という方針を損失に反映させる手法
+

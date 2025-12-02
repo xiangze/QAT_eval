@@ -11,7 +11,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import util
+import qutil
 
 # ---------------------------
 # STE helpers
@@ -202,7 +202,7 @@ def wrap_model_with_ot_quant(model: nn.Module, allocator: DifferentiableAllocato
     Replace Conv2d/Linear with OTQuant* modules preserving weights/bias.
     The allocator will be injected to each layer.
     """
-    layer_names = [name for name, m in util.iter_quant_layers(model) ]
+    layer_names = [name for name, m in qutil.iter_quant_layers(model) ]
 
     # recursive replace
     idx = 0
@@ -266,7 +266,7 @@ def fisher_sensitivity_step(
 
     # collect
     sens = {}
-    for name, m in util.iter_quant_layers(model):
+    for name, m in qutil.iter_quant_layers(model):
         g2_sum, n = 0.0, 0
         for p in m.parameters():
             if p.grad is None: continue
