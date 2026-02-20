@@ -1,9 +1,9 @@
 # Mixed-Precision Quantization evaluation
-  - HAWQ2_fisher (greedy via empirical Fisher)
+  - [HAWQ2_fisher](https://proceedings.neurips.cc/paper_files/paper/2020/hash/d77c703536718b95308130ff2e5cf9ee-Abstract.html) (greedy via empirical Fisher)
   - OT_HAWQ_like (Sinkhorn OT with size-weighted marginals)
   - OT_Fisher_Critical (same API; if no critical classes -> same as OT_HAWQ_like)
   - DiffSinkhornDynamic (differentiable Sinkhorn with STE mixture + short QAT)
-  - SinkhornMCKPDynamic (MCKP (Chen et al. quadratic cost) + short QAT)
+  - SinkhornMCKPDynamic ([MCKP (Chen et al. quadratic cost)](https://openaccess.thecvf.com/content/ICCV2021/papers/Chen_Towards_Mixed-Precision_Quantization_of_Neural_Networks_via_Constrained_Optimization_ICCV_2021_paper.pdf) + short QAT)
 
 # Usage
 > python eval_quant_methods.py --train_cifar10 --model resnet18 --train_epochs 2 --methods HAWQ2_fisher OT_HAWQ_like DiffSinkhornDynamic SinkhornMCKPDynamic --out_dir runs/cifar_res18
