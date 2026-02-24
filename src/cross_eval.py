@@ -19,8 +19,28 @@ import Dynamic_sinkhorn as Dyns
 import json
 from eval_methods_basic import apply_assignment_inplace,evaluate_top1,quantized_weight_size_mb,mean_bits,save_assignment_csv,model_fp32_size_mb,restore_from_backup
 
+try:
+    from transformers import AutoImageProcessor, ViTForImageClassification
+except Exception:
+    AutoImageProcessor = None
+    ViTForImageClassification = None
+
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+HF_VIT_ALIASES = {
+    "vit": "google/vit-base-patch16-224",
+    "vit_b16_hf": "google/vit-base-patch16-224",
+    "vit-base-patch16-224": "google/vit-base-patch16-224",
+    "google/vit-base-patch16-224": "google/vit-base-patch16-224",
+}
+
+def is_hf_vit_name(name: str) -> bool:
+    n = name.lower()
+    return (n in HF_VIT_ALIASES) or n.startswith("hf:google/vit-")
+
+def normalize_hf_model_name(name: str) -> str:
+    return name[3:] if name.lower().startswith("hf:") else HF_VIT_ALIASES.get(name.lower(), name)
 
 def infer_input_size_from_weights(weights) -> int:
     # weights.transforms() は Resize/CenterCrop を含む Compose を返す。
@@ -82,6 +102,13 @@ def build_transforms(weights=None, train: bool = True, force_rgb: bool = True) -
         # 上の Lambda は PIL→PIL のまま抜けるダミー。Grayscale は PIL 画像にのみ作用。
 
     return transforms.Compose(tf)
+
+def is_hf_vit_name(name: str) -> bool:
+    n = name.lower()
+    return (n in HF_VIT_ALIASES) or n.startswith("hf:google/vit-")
+
+def normalize_hf_model_name(name: str) -> str:
+    return name[3:] if name.lower().startswith("hf:") else HF_VIT_ALIASES.get(name.lower(), name)
 
 def load_dataset(name: str, root: str, train_tf, eval_tf, val_split: float = 0.1, seed: int = 0):
     name_lower = name.lower()
@@ -186,6 +213,17 @@ def accuracy_from_logits(logits: torch.Tensor, targets: torch.Tensor) -> float:
     correct = (preds == targets).sum().item()
     return correct / max(1, targets.size(0))
 
+def _forward_logits(model, x):
+    if isinstance(x, dict):
+        out = model(**x)
+        if hasattr(out, "logits"):
+            return out.logits
+        if isinstance(out, dict) and "logits" in out:
+            return out["logits"]
+        return out
+    out = model(x)
+    return out.logits if hasattr(out, "logits") else out
+
 def run_epoch(model, loader, criterion, optimizer, device, train: bool) -> Tuple[float, float]:
     model=model.to(device)
     if train:
@@ -199,21 +237,25 @@ def run_epoch(model, loader, criterion, optimizer, device, train: bool) -> Tuple
 
     with torch.set_grad_enabled(train):
         for imgs, labels in loader:
-            imgs = imgs.to(device, non_blocking=True)
+            if isinstance(imgs, dict):
+                imgs = {k: v.to(device, non_blocking=True) for k, v in imgs.items()}
+            else:
+                imgs = imgs.to(device, non_blocking=True)
+
             labels = labels.to(device, non_blocking=True)
 
             if train:
                 optimizer.zero_grad()
 
-            outputs = model(imgs)
-            loss = criterion(outputs, labels)
+            logits = _forward_logits(model, imgs)
+            loss = criterion(logits, labels)
 
             if train:
                 loss.backward()
                 optimizer.step()
 
             running_loss += loss.item() * labels.size(0)
-            running_correct += (outputs.argmax(1) == labels).sum().item()
+            running_correct += (logits.argmax(1) == labels).sum().item()
             running_total += labels.size(0)
 
     avg_loss = running_loss / max(1, running_total)
@@ -239,7 +281,9 @@ def main(args):
 
     # 1) Weights の取得
     weights = None
-    if args.pretrained:
+    hf_image_processor = None
+    use_hf_vit = is_hf_vit_name(args.model)
+    if args.pretrained and (not use_hf_vit):
         try:
             # 例: get_model_weights("resnet18") -> ResNet18_Weights Enum、.DEFAULT を使う
             enum = get_model_weights(args.model)
@@ -247,10 +291,31 @@ def main(args):
         except Exception:
             print(f"[WARN] Could not get weights enum for {args.model}; proceeding without pretrained weights.")
             weights = None
+    if use_hf_vit:
+        if AutoImageProcessor is None or ViTForImageClassification is None:
+            raise ImportError("transformers is required for HF ViT. Please `pip install transformers`.")
+        hf_image_processor = AutoImageProcessor.from_pretrained(normalize_hf_model_name(args.model))
 
     # 2) Transforms
     train_tf = build_transforms(weights, train=True,  force_rgb=True)
     eval_tf  = build_transforms(weights, train=False, force_rgb=True)
+    if use_hf_vit:
+        size = 224
+        try:
+            s = getattr(hf_image_processor, "size", 224)
+            if isinstance(s, dict):
+                size = int(s.get("height", s.get("shortest_edge", 224)))
+            elif isinstance(s, (tuple, list)):
+                size = int(s[0])
+            else:
+                size = int(s)
+        except Exception:
+            size = 224
+        train_tf = build_hf_pil_transforms(train=True, force_rgb=True, size=size)
+        eval_tf  = build_hf_pil_transforms(train=False, force_rgb=True, size=size)
+    else:
+        train_tf = build_transforms(weights, train=True,  force_rgb=True)
+        eval_tf  = build_transforms(weights, train=False, force_rgb=True)
 
     # 3) Dataset & DataLoaders
     train_set, val_set, test_set = load_dataset(args.dataset, args.data_root, train_tf, eval_tf, args.val_split, args.seed)
@@ -258,21 +323,42 @@ def main(args):
     if (num_classes is None or num_classes == 0):
         raise RuntimeError("Could not infer num_classes from dataset. Ensure your dataset exposes `.classes` (ImageFolder etc.).")
 
+    hf_collate = None
+    if use_hf_vit:
+        def hf_collate(batch_items):
+            imgs, labels = zip(*batch_items)
+            enc = hf_image_processor(images=list(imgs), return_tensors="pt")
+            return {"pixel_values": enc["pixel_values"]}, torch.tensor(labels, dtype=torch.long)
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True)
+                              num_workers=args.num_workers, pin_memory=True, collate_fn=hf_collate)
     val_loader   = DataLoader(val_set,   batch_size=args.batch_size, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=True)
+                              num_workers=args.num_workers, pin_memory=True, collate_fn=hf_collate)
     test_loader  = DataLoader(test_set,  batch_size=args.batch_size, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=True)
+                              num_workers=args.num_workers, pin_memory=True, collate_fn=hf_collate)
 
     # 4) Model
-    model_ctor = getattr(torchvision.models, args.model, None)
-    if model_ctor is None:
-        raise ValueError(f"Unknown model name: {args.model}")
-    model = model_ctor(weights=weights).to(device)
+    if use_hf_vit:
+        hf_ckpt = normalize_hf_model_name(args.model)
+        def model_ctor(weights_override=None):
+            if args.pretrained:
+                if num_classes == 1000:
+                    return ViTForImageClassification.from_pretrained(hf_ckpt)
+                return ViTForImageClassification.from_pretrained(
+                    hf_ckpt, num_labels=num_classes, ignore_mismatched_sizes=True
+                )
+            return ViTForImageClassification.from_pretrained(
+                hf_ckpt, num_labels=num_classes, ignore_mismatched_sizes=True
+            )
+        model = model_ctor().to(device)
+    else:
+        tv_ctor = getattr(torchvision.models, args.model, None)
+        if tv_ctor is None:
+            raise ValueError(f"Unknown model name: {args.model}")
+        def model_ctor(weights_override=None):
+            return tv_ctor(weights=weights_override)
+        model = model_ctor(weights).to(device)
+        model = replace_classifier(model, num_classes)# 最終層をクラス数に合わせて置換
 
-    # 最終層をクラス数に合わせて置換
-    model = replace_classifier(model, num_classes)
 
     # 5) Optimizer / Loss
     criterion = nn.CrossEntropyLoss()
@@ -298,7 +384,12 @@ def main(args):
     for meth in methods:
         print(f"\n=== [{meth}] ===")
         # fresh copy
-        qmodel = model_ctor().to(device)
+        if use_hf_vit:
+            qmodel = model_ctor().to(device)
+        else:
+            qmodel = model_ctor(weights=None).to(device)
+            qmodel = replace_classifier(qmodel, num_classes).to(device)
+
         # build assignment
         if meth == "HAWQ2_fisher":
             assignment = h2.hawq2_fisher_allocate(qmodel, val_loader, device, args.bits, args.avg_bits, batches=args.sens_batches)
@@ -346,7 +437,10 @@ if __name__ == "__main__":
     p.add_argument("--dataset",      type=str, required=True,
                         help="Dataset name: ImageFolder | MNIST | FashionMNIST | CIFAR10 | CIFAR100 | STL10 | SVHN")
     p.add_argument("--data-root",    type=str,   default="data/", help="Dataset root. For ImageFolder, use root/ or root/train,root/val")
-    p.add_argument("--model",        type=str,   default="resnet18", help="torchvision.models.* name (e.g., resnet18, efficientnet_b0, mobilenet_v3_small)")
+    p.add_argument("--model",        type=str,   default="resnet18",
+                   help=("torchvision.models.* name (e.g., resnet18, vit_b_16) "
+                         "or HF ViT alias: vit | vit_b16_hf | vit-base-patch16-224 | "
+                         "hf:google/vit-base-patch16-224"))
     p.add_argument("--epochs",       type=int,   default=30)
     p.add_argument("--batch-size",   type=int,   default=64)
     p.add_argument("--lr",           type=float, default=1e-3)

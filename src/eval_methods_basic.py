@@ -14,7 +14,7 @@ Outputs:
 
 import argparse, json, os, math, csv, time
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Iterable, Optional, Callable
+from typing import List, Dict, Tuple, Iterable, Optional, Callable, Any
 
 import torch
 import torch.nn as nn
@@ -102,57 +102,117 @@ def mean_bits(assignment: Dict[str, int], model: nn.Module) -> float:
 # Data & model builders
 # =========================
 
-def build_cifar10_loaders(batch=128, num_workers=4, train_aug=False):
+def build_cifar10_loaders(batch=128, num_workers=4, train_aug=False, preprocessor=None):
     from torchvision import datasets, transforms
-    tfm_train = [
-        transforms.Resize(224),
-        transforms.RandomHorizontalFlip() if train_aug else transforms.Lambda(lambda x: x),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
-    ]
-    tfm_train = [t for t in tfm_train if not isinstance(t, transforms.Lambda)]
-    tfm_train = transforms.Compose(tfm_train)
+    if preprocessor is None:
+        tfm_train = [
+            transforms.Resize(224),
+            transforms.RandomHorizontalFlip() if train_aug else transforms.Lambda(lambda x: x),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+        ]
+        tfm_train = [t for t in tfm_train if not isinstance(t, transforms.Lambda)]
+        tfm_train = transforms.Compose(tfm_train)
+        tfm_test = transforms.Compose([
+            transforms.Resize(224),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+        ])
+        train = datasets.CIFAR10(root="./data", train=True, download=True, transform=tfm_train)
+        test = datasets.CIFAR10(root="./data", train=False, download=True, transform=tfm_test)
+        return DataLoader(train, batch_size=batch, shuffle=True, num_workers=num_workers, pin_memory=True), \
+               DataLoader(test, batch_size=batch, shuffle=False, num_workers=num_workers, pin_memory=True), 10
 
-    tfm_test = transforms.Compose([
-        transforms.Resize(224),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
-    ])
+    # HF Transformers 用: PIL画像をcollate_fnでpreprocessor処理
+    tfm_train = [transforms.RandomHorizontalFlip()] if train_aug else []
+    tfm_train = transforms.Compose(tfm_train) if len(tfm_train) > 0 else None
     train = datasets.CIFAR10(root="./data", train=True, download=True, transform=tfm_train)
-    test  = datasets.CIFAR10(root="./data", train=False, download=True, transform=tfm_test)
-    return DataLoader(train, batch_size=batch, shuffle=True, num_workers=num_workers, pin_memory=True), \
-           DataLoader(test,  batch_size=batch, shuffle=False, num_workers=num_workers, pin_memory=True), 10
+    test = datasets.CIFAR10(root="./data", train=False, download=True, transform=None)
 
-def build_imagenet_val_loader(val_dir: str, batch=128, num_workers=8):
+    def hf_collate(batch_items):
+        imgs, labels = zip(*batch_items)
+        enc = preprocessor(images=list(imgs), return_tensors="pt")
+        return {"pixel_values": enc["pixel_values"]}, torch.tensor(labels, dtype=torch.long)
+
+    return DataLoader(train, batch_size=batch, shuffle=True, num_workers=num_workers, pin_memory=True, collate_fn=hf_collate), \
+           DataLoader(test, batch_size=batch, shuffle=False, num_workers=num_workers, pin_memory=True, collate_fn=hf_collate), 10
+
+def build_imagenet_val_loader(val_dir: str, batch=128, num_workers=8, preprocessor=None):
     from torchvision import datasets, transforms
+    if preprocessor is None:
+        tfm = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+        ])
+        ds = datasets.ImageFolder(val_dir, transform=tfm)
+        return DataLoader(ds, batch_size=batch, shuffle=False, num_workers=num_workers, pin_memory=True), 1000
+
     tfm = transforms.Compose([
-        transforms.Resize(256), transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
     ])
     ds = datasets.ImageFolder(val_dir, transform=tfm)
-    return DataLoader(ds, batch_size=batch, shuffle=False, num_workers=num_workers, pin_memory=True), 1000
+
+    def hf_collate(batch_items):
+        imgs, labels = zip(*batch_items)
+        enc = preprocessor(images=list(imgs), return_tensors="pt")
+        return {"pixel_values": enc["pixel_values"]}, torch.tensor(labels, dtype=torch.long)
+
+    return DataLoader(ds, batch_size=batch, shuffle=False, num_workers=num_workers, pin_memory=True, collate_fn=hf_collate), 1000
 
 def build_model(name: str, num_classes: int, pretrained_tv: bool, device: torch.device):
+    """
+    Returns:
+      (model, preprocessor)
+      - torchvision models -> preprocessor = None
+      - transformers ViT   -> preprocessor = HF image processor
+    """
     from torchvision import models
     name = name.lower()
-    if name == "resnet18":
+    if name in ["resnet18", "mobilenet_v2"]:
+        from torchvision import models
+        if name == "resnet18":
+            if pretrained_tv:
+                m = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+                if m.fc.out_features != num_classes:
+                    m.fc = nn.Linear(m.fc.in_features, num_classes)
+            else:
+                m = models.resnet18(num_classes=num_classes)
+        elif name == "mobilenet_v2":
+            if pretrained_tv:
+                m = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.IMAGENET1K_V1)
+                if m.classifier[-1].out_features != num_classes:
+                    m.classifier[-1] = nn.Linear(m.classifier[-1].in_features, num_classes)
+            else:
+                m = models.mobilenet_v2(num_classes=num_classes)
+        return m.to(device), None
+
+    elif name in ["vit", "vit_b16", "vit-base-patch16-224", "vit_base_patch16_224"]:
+        from transformers import AutoImageProcessor, ViTForImageClassification
+        ckpt = "google/vit-base-patch16-224"
+        image_processor = AutoImageProcessor.from_pretrained(ckpt)
+
         if pretrained_tv:
-            m = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-            if m.fc.out_features != num_classes:
-                m.fc = nn.Linear(m.fc.in_features, num_classes)
+            if num_classes == 1000:
+                m = ViTForImageClassification.from_pretrained(ckpt)
+            else:
+                m = ViTForImageClassification.from_pretrained(
+                    ckpt,
+                    num_labels=num_classes,
+                    ignore_mismatched_sizes=True,
+                )
         else:
-            m = models.resnet18(num_classes=num_classes)
-    elif name == "mobilenet_v2":
-        if pretrained_tv:
-            m = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.IMAGENET1K_V1)
-            if m.classifier[-1].out_features != num_classes:
-                m.classifier[-1] = nn.Linear(m.classifier[-1].in_features, num_classes)
-        else:
-            m = models.mobilenet_v2(num_classes=num_classes)
+            # 現状はckpt構造を使ってheadだけ差し替え（完全ランダム初期化ではない）
+            m = ViTForImageClassification.from_pretrained(
+                ckpt,
+                num_labels=num_classes,
+                ignore_mismatched_sizes=True,
+            )
+        return m.to(device), image_processor
     else:
         raise ValueError(f"Unsupported model: {name}")
-    return m.to(device)
 
 def train_cifar_quick(model: nn.Module, train_loader, test_loader, device, epochs=2, lr=1e-3):
     opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -160,9 +220,16 @@ def train_cifar_quick(model: nn.Module, train_loader, test_loader, device, epoch
     for ep in range(epochs):
         model.train()
         for x,y in train_loader:
-            x,y = x.to(device), y.to(device)
+            y = y.to(device)
+            if isinstance(x, dict):
+                x = {k: v.to(device) for k, v in x.items()}
+                out = model(**x)
+                logits = out.logits if hasattr(out, "logits") else out["logits"]
+            else:
+                x = x.to(device)
+                out = model(x)
+                logits = out.logits if hasattr(out, "logits") else out
             opt.zero_grad()
-            logits = model(x)
             loss = ce(logits, y)
             loss.backward()
             opt.step()
@@ -176,17 +243,20 @@ def evaluate_top1(model: nn.Module, loader: DataLoader, device) -> float:
     corr = 0
     total = 0
     for x,y in loader:
-        try:
-            x =x.to(device)
-            y =y.to(device)
-        except:
-            x={k:v.to(device)for k, v in x.items()}
-            y =y.to(device)
-            for k, v in x.items():
-                print(k,v.shape)
-            print("y",y)
-            exit()
-        logits = model(x)
+        y = y.to(device)
+        if isinstance(x, dict):
+            x = {k: v.to(device) for k, v in x.items()}
+            out = model(**x)
+            if hasattr(out, "logits"):
+                logits = out.logits
+            elif isinstance(out, dict) and "logits" in out:
+                logits = out["logits"]
+            else:
+                logits = out
+        else:
+            x = x.to(device)
+            out = model(x)
+            logits = out.logits if hasattr(out, "logits") else out
         pred = logits.argmax(dim=1)
         corr += (pred == y).sum().item()
         total += y.numel()
@@ -207,23 +277,34 @@ def run(args):
 
     # Data & model
     if args.train_cifar10:
-        train_loader, test_loader, ncls = build_cifar10_loaders(batch=args.batch, num_workers=args.workers, train_aug=True)
-        model = build_model(args.model, ncls, pretrained_tv=False, device=device)
+        # preprocessorの有無を先に取得
+        _tmp_model, preprocessor = build_model(args.model, 10, pretrained_tv=False, device=device)
+        del _tmp_model
+        train_loader, test_loader, ncls = build_cifar10_loaders(
+            batch=args.batch, num_workers=args.workers, train_aug=True, preprocessor=preprocessor
+        )
+        model, preprocessor = build_model(args.model, ncls, pretrained_tv=False, device=device)
         model = train_cifar_quick(model, train_loader, test_loader, device, epochs=args.train_epochs, lr=args.lr)
         eval_loader = test_loader
-        model_ctor = lambda: build_model(args.model, ncls, pretrained_tv=False, device=device)
+        model_ctor = lambda: build_model(args.model, ncls, pretrained_tv=False, device=device)[0]
     else:
         # torchvision pretrained; need a val loader (ImageNet val path or CIFAR10 test fallback)
         if args.imagenet_val:
-            eval_loader, ncls = build_imagenet_val_loader(args.imagenet_val, batch=args.batch, num_workers=args.workers)
-            model = build_model(args.model, 1000, pretrained_tv=True, device=device)
-            model_ctor = lambda: build_model(args.model, 1000, pretrained_tv=True, device=device)
+            ncls=1000
+            model, preprocessor = build_model(args.model, ncls, pretrained_tv=True, device=device)
+            eval_loader, ncls = build_imagenet_val_loader(
+                args.imagenet_val, batch=args.batch, num_workers=args.workers, preprocessor=preprocessor
+            )
         else:
             # fallback to CIFAR10 test (head adapted to 10 classes)
-            train_loader, test_loader, ncls = build_cifar10_loaders(batch=args.batch, num_workers=args.workers)
-            model = build_model(args.model, ncls, pretrained_tv=True, device=device)
+            _tmp_model, preprocessor = build_model(args.model, 10, pretrained_tv=True, device=device)
+            del _tmp_model
+            train_loader, test_loader, ncls = build_cifar10_loaders(
+                batch=args.batch, num_workers=args.workers, preprocessor=preprocessor
+            )
+            model, preprocessor = build_model(args.model, ncls, pretrained_tv=True, device=device)
             eval_loader = test_loader
-            model_ctor = lambda: build_model(args.model, ncls, pretrained_tv=True, device=device)
+        model_ctor = lambda: build_model(args.model, ncls, pretrained_tv=True, device=device)[0]
 
     # Baseline FP32
     base_acc = evaluate_top1(model, eval_loader, device)
@@ -298,7 +379,7 @@ def run(args):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", type=str, default="resnet18", help="resnet18|mobilenet_v2")
+    p.add_argument("--model", type=str, default="resnet18", help="resnet18|mobilenet_v2|vit")
     p.add_argument("--cpu", action="store_true")
     # data options
     p.add_argument("--train_cifar10", action="store_true", help="train on CIFAR10 quickly instead of using torchvision pretrained")
