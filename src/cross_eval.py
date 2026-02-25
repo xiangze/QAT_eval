@@ -103,12 +103,22 @@ def build_transforms(weights=None, train: bool = True, force_rgb: bool = True) -
 
     return transforms.Compose(tf)
 
-def is_hf_vit_name(name: str) -> bool:
-    n = name.lower()
-    return (n in HF_VIT_ALIASES) or n.startswith("hf:google/vit-")
-
-def normalize_hf_model_name(name: str) -> str:
-    return name[3:] if name.lower().startswith("hf:") else HF_VIT_ALIASES.get(name.lower(), name)
+def build_hf_pil_transforms(train: bool = True, force_rgb: bool = True, size: int = 224) -> transforms.Compose:
+    tf = []
+    if force_rgb:
+        tf.append(transforms.Grayscale(num_output_channels=3))
+    if train:
+        tf += [
+            transforms.Resize(int(size * 1.14)),
+            transforms.RandomResizedCrop(size),
+            transforms.RandomHorizontalFlip(),
+        ]
+    else:
+        tf += [
+            transforms.Resize(256),
+            transforms.CenterCrop(size),
+        ]
+    return transforms.Compose(tf)
 
 def load_dataset(name: str, root: str, train_tf, eval_tf, val_split: float = 0.1, seed: int = 0):
     name_lower = name.lower()
