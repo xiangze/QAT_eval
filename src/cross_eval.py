@@ -18,6 +18,8 @@ import sinkhorn_fisher as OT
 import Dynamic_sinkhorn as Dyns
 import json
 from eval_methods_basic import apply_assignment_inplace,evaluate_top1,quantized_weight_size_mb,mean_bits,save_assignment_csv,model_fp32_size_mb,restore_from_backup
+import timm
+from timm.models import create_model
 
 try:
     from transformers import AutoImageProcessor, ViTForImageClassification
@@ -307,8 +309,6 @@ def main(args):
         hf_image_processor = AutoImageProcessor.from_pretrained(normalize_hf_model_name(args.model))
 
     # 2) Transforms
-    train_tf = build_transforms(weights, train=True,  force_rgb=True)
-    eval_tf  = build_transforms(weights, train=False, force_rgb=True)
     if use_hf_vit:
         size = 224
         try:

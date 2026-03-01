@@ -46,6 +46,9 @@ import HAWQ2_fisher as h2
 import sinkhorn_fisher as ot
 
 from torchvision.datasets import CocoDetection
+import timm 
+from timm.models import create_model 
+
 # -----------------------------
 # 合成 DETR 校正データセット
 # -----------------------------
